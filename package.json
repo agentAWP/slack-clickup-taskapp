@@ -1,0 +1,20 @@
+{
+  "name": "slack-clickup-tasker",
+  "version": "1.0.0",
+  "description": "Slack slash command that creates ClickUp tasks and posts confirmation back to Slack.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "slack",
+    "clickup",
+    "integration",
+    "webhook"
+  ],
+  "license": "MIT"
+}
