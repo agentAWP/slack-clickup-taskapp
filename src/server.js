@@ -30,7 +30,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         app: "Slack to ClickUp Tasker",
         purpose: "Create ClickUp tasks from a Slack slash command.",
-        sampleCommand: "/taskapp Review FDE submission | priority: high | due: tomorrow",
+        sampleCommand: "/taskapp Review FDE submission | assign: jay | tags: demo,interview | priority: high | due: tomorrow",
         workflow: [
           "Slack sends a signed slash-command webhook to this app.",
           "The app verifies the Slack request signature.",
@@ -46,7 +46,9 @@ const server = http.createServer(async (req, res) => {
         },
         commandSyntax: {
           command: "/taskapp",
-          format: "/taskapp Task name | priority: high | due: tomorrow | description: details",
+          format: "/taskapp Task name | assign: jay | tags: bug,auth | priority: high | due: tomorrow | description: details",
+          assignees: "Use ClickUp user IDs directly or aliases from CLICKUP_ASSIGNEE_ALIASES.",
+          tags: "Comma-separated tags. The app always includes the default slack tag.",
           priorities: ["urgent", "high", "normal", "low"],
           dueDateExamples: ["today", "tomorrow", "2026-06-10"]
         }
@@ -70,6 +72,8 @@ const server = http.createServer(async (req, res) => {
         description: payload.description,
         priority: payload.priority,
         due: payload.due,
+        assignees: payload.assignees || payload.assignee,
+        tags: payload.tags,
         slackChannelId: payload.channel || process.env.SLACK_DEFAULT_CHANNEL_ID,
         source: "api"
       });
@@ -111,6 +115,8 @@ const server = http.createServer(async (req, res) => {
         description: parsed.description || `Created from Slack by ${form.get("user_name") || form.get("user_id") || "unknown user"}.`,
         priority: parsed.priority,
         due: parsed.due,
+        assignees: parsed.assignees,
+        tags: parsed.tags,
         slackChannelId: form.get("channel_id"),
         source: "slack_command",
         slackUserId: form.get("user_id"),
@@ -120,7 +126,7 @@ const server = http.createServer(async (req, res) => {
       return sendJson(res, 200, {
         response_type: "ephemeral",
         text: result.ok
-          ? `Created ClickUp task: ${result.clickupTask.name}\n${result.clickupTask.url}`
+          ? buildSlackConfirmation(result)
           : `Could not create ClickUp task: ${result.error}`,
         workflow: result
       });
@@ -146,8 +152,18 @@ async function runTaskWorkflow(input) {
     return { ok: false, error: validationError };
   }
 
+  const assignees = resolveClickUpAssignees(input.assignees);
+  if (!assignees.ok) {
+    return { ok: false, source: input.source, error: assignees.error };
+  }
+
+  const tags = normalizeTags(input.tags);
+
   try {
-    const clickupTask = await createClickUpTask(input);
+    const clickupTask = await createClickUpTask(input, {
+      assigneeIds: assignees.ids,
+      tags
+    });
     const slackMessage = input.postSlackConfirmation === false
       ? { skipped: true, reason: "Slash command response is used as the Slack confirmation." }
       : await postSlackMessage({
@@ -155,6 +171,8 @@ async function runTaskWorkflow(input) {
         text: [
           `ClickUp task created: ${clickupTask.name}`,
           clickupTask.url,
+          assignees.labels.length ? `Assigned to: ${assignees.labels.join(", ")}` : null,
+          tags.length ? `Tags: ${tags.join(", ")}` : null,
           `Priority: ${normalizePriority(input.priority).label}`
         ].filter(Boolean).join("\n")
       });
@@ -166,6 +184,8 @@ async function runTaskWorkflow(input) {
         taskName: input.taskName,
         priority: normalizePriority(input.priority).label,
         due: input.due || null,
+        assignees: assignees.labels,
+        tags,
         slackChannelId: input.slackChannelId || null
       },
       clickupTask,
@@ -188,14 +208,16 @@ function validateWorkflowInput(input) {
   return null;
 }
 
-async function createClickUpTask(input) {
+async function createClickUpTask(input, options = {}) {
   const priority = normalizePriority(input.priority);
   const body = {
     name: input.taskName.trim(),
     description: input.description || "Created by the Slack to ClickUp integration.",
     priority: priority.value,
-    tags: ["slack"]
+    tags: mergeTags(["slack"], options.tags)
   };
+
+  if (options.assigneeIds?.length) body.assignees = options.assigneeIds;
 
   const dueDate = parseDueDate(input.due);
   if (dueDate) body.due_date = dueDate;
@@ -218,6 +240,15 @@ async function createClickUpTask(input) {
   return {
     id: data.id,
     name: data.name,
+    assignees: Array.isArray(data.assignees)
+      ? data.assignees.map((assignee) => ({
+        id: assignee.id,
+        username: assignee.username || assignee.email || null
+      }))
+      : [],
+    tags: Array.isArray(data.tags)
+      ? data.tags.map((tag) => tag.name || tag).filter(Boolean)
+      : [],
     status: data.status?.status || null,
     url: data.url || null
   };
@@ -261,6 +292,8 @@ function parseSlackCommand(text) {
 
     if (key === "priority") result.priority = value;
     if (key === "due") result.due = value;
+    if (key === "assign" || key === "assignee" || key === "assignees") result.assignees = value;
+    if (key === "tags") result.tags = value;
     if (key === "description" || key === "desc") result.description = value;
   }
 
@@ -274,10 +307,85 @@ function isHelpCommand(text) {
 
 function buildUsageText(commandName) {
   return [
-    `Usage: ${commandName} Task name | priority: high | due: tomorrow | description: details`,
+    `Usage: ${commandName} Task name | assign: jay | tags: bug,auth | priority: high | due: tomorrow | description: details`,
+    "Assign: ClickUp user ID or alias from CLICKUP_ASSIGNEE_ALIASES",
+    "Tags: comma-separated values",
     "Priorities: urgent, high, normal, low",
     "Due: today, tomorrow, or YYYY-MM-DD"
   ].join("\n");
+}
+
+function buildSlackConfirmation(result) {
+  return [
+    `Created ClickUp task: ${result.clickupTask.name}`,
+    result.clickupTask.url,
+    result.requested.assignees.length ? `Assigned to: ${result.requested.assignees.join(", ")}` : null,
+    result.requested.tags.length ? `Tags: ${result.requested.tags.join(", ")}` : null
+  ].filter(Boolean).join("\n");
+}
+
+function resolveClickUpAssignees(input) {
+  const values = normalizeList(input);
+  if (!values.length) return { ok: true, ids: [], labels: [] };
+
+  const aliases = parseAssigneeAliases();
+  const ids = [];
+  const labels = [];
+
+  for (const value of values) {
+    if (/^\d+$/.test(value)) {
+      const id = Number(value);
+      ids.push(id);
+      labels.push(value);
+      continue;
+    }
+
+    const alias = value.toLowerCase();
+    if (!aliases[alias]) {
+      return {
+        ok: false,
+        error: `Unknown assignee alias "${value}". Add it to CLICKUP_ASSIGNEE_ALIASES or use a ClickUp user ID.`
+      };
+    }
+
+    ids.push(aliases[alias]);
+    labels.push(value);
+  }
+
+  return {
+    ok: true,
+    ids: [...new Set(ids)],
+    labels: [...new Set(labels)]
+  };
+}
+
+function parseAssigneeAliases() {
+  const aliases = {};
+  for (const pair of normalizeList(process.env.CLICKUP_ASSIGNEE_ALIASES)) {
+    const [rawName, rawId] = pair.split(":");
+    const name = rawName?.trim().toLowerCase();
+    const id = rawId?.trim();
+    if (name && /^\d+$/.test(id)) aliases[name] = Number(id);
+  }
+  return aliases;
+}
+
+function normalizeTags(input) {
+  return mergeTags(normalizeList(input));
+}
+
+function mergeTags(...tagGroups) {
+  const tags = tagGroups.flatMap((group) => normalizeList(group));
+  return [...new Set(tags.map((tag) => tag.toLowerCase()))];
+}
+
+function normalizeList(input) {
+  if (!input) return [];
+  const values = Array.isArray(input) ? input : String(input).split(",");
+  return values
+    .flatMap((value) => Array.isArray(value) ? value : String(value).split(","))
+    .map((value) => value.trim())
+    .filter(Boolean);
 }
 
 function normalizePriority(priority) {

@@ -8,6 +8,7 @@ Lightweight FDE take-home app that connects Slack and ClickUp. A Slack slash com
 - Verifies Slack requests with the Slack signing secret.
 - Parses task details from the command text.
 - Creates a task in a configured ClickUp List.
+- Supports ClickUp assignees and custom tags.
 - Returns one ephemeral Slack confirmation for slash-command requests.
 - Exposes `POST /api/create-clickup-task` for direct testing; this endpoint creates a ClickUp task and posts a Slack message.
 - Exposes `GET /health` and `GET /demo` for live inspection.
@@ -15,7 +16,7 @@ Lightweight FDE take-home app that connects Slack and ClickUp. A Slack slash com
 Example Slack command:
 
 ```text
-/taskapp Review FDE submission | priority: high | due: tomorrow | description: Final demo prep
+/taskapp Review FDE submission | assign: jay | tags: demo,interview | priority: high | due: tomorrow | description: Final demo prep
 ```
 
 ## Requirements
@@ -46,7 +47,10 @@ SLACK_SIGNING_SECRET=your-signing-secret
 SLACK_DEFAULT_CHANNEL_ID=C1234567890
 CLICKUP_TOKEN=pk_your-token
 CLICKUP_LIST_ID=901714346157
+CLICKUP_ASSIGNEE_ALIASES=jay:32644579,alex:12345678
 ```
+
+`CLICKUP_ASSIGNEE_ALIASES` lets the Slack command use friendly names instead of raw ClickUp user IDs. You can also pass numeric ClickUp user IDs directly.
 
 Start the server:
 
@@ -79,6 +83,8 @@ curl --request POST \
     "description": "Created by the direct workflow endpoint",
     "priority": "high",
     "due": "tomorrow",
+    "assignee": "jay",
+    "tags": ["demo", "api"],
     "channel": "YOUR_SLACK_CHANNEL_ID"
   }'
 ```
@@ -86,6 +92,7 @@ curl --request POST \
 Expected result:
 
 - A task is created in ClickUp.
+- The task is assigned and tagged when `assignee`/`assignees` and `tags` are supplied.
 - A message is posted to Slack.
 - The API returns JSON with the ClickUp task ID, task URL, and Slack message timestamp.
 
@@ -106,7 +113,7 @@ https://YOUR_DEPLOYED_APP/slack/commands/clickup-task
 Try this in Slack:
 
 ```text
-/taskapp Review FDE submission | priority: high | due: tomorrow
+/taskapp Review FDE submission | assign: jay | tags: demo,interview | priority: high | due: tomorrow
 ```
 
 Help and validation examples:
@@ -114,6 +121,18 @@ Help and validation examples:
 ```text
 /taskapp help
 /taskapp
+```
+
+Supported command fields:
+
+```text
+assign: ClickUp user ID or alias from CLICKUP_ASSIGNEE_ALIASES
+assignee: same as assign
+assignees: comma-separated aliases or ClickUp user IDs
+tags: comma-separated ClickUp tags
+priority: urgent, high, normal, low
+due: today, tomorrow, or YYYY-MM-DD
+description: task description
 ```
 
 ## Local tunnel testing
@@ -133,7 +152,7 @@ https://YOUR_TRYCLOUDFLARE_URL/slack/commands/clickup-task
 Then test:
 
 ```text
-/taskapp Local tunnel test | priority: high | due: tomorrow
+/taskapp Local tunnel test | assign: jay | tags: tunnel,demo | priority: high | due: tomorrow
 ```
 
 ## Render deployment
@@ -156,6 +175,7 @@ SLACK_SIGNING_SECRET
 SLACK_DEFAULT_CHANNEL_ID
 CLICKUP_TOKEN
 CLICKUP_LIST_ID
+CLICKUP_ASSIGNEE_ALIASES
 ```
 
 After deployment, update the Slack slash command Request URL to:
@@ -184,7 +204,7 @@ This app connects Slack and ClickUp. Slack sends a signed slash-command webhook 
 Live demo command:
 
 ```text
-/taskapp Render demo task | priority: high | due: tomorrow | description: Created during the FDE debrief
+/taskapp Render demo task | assign: jay | tags: render,demo | priority: high | due: tomorrow | description: Created during the FDE debrief
 ```
 
 ## Screenshots
@@ -202,6 +222,7 @@ The app gracefully handles:
 - Missing task name.
 - Missing ClickUp token or list ID.
 - Missing Slack bot token.
+- Unknown ClickUp assignee alias.
 - ClickUp API errors.
 - Slack API errors.
 - Invalid Slack request signatures when `SLACK_SIGNING_SECRET` is configured.
@@ -216,5 +237,6 @@ The app gracefully handles:
 
 - This demo uses environment variables for Slack and ClickUp credentials.
 - The Slack command name is `/taskapp`.
+- Assignee aliases are configured through `CLICKUP_ASSIGNEE_ALIASES`.
 - The ClickUp List ID is configured once for the demo.
 - A production multi-tenant version would store Slack workspace IDs and ClickUp workspace/list selections per connection.
