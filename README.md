@@ -6,9 +6,9 @@ Lightweight FDE take-home app that connects Slack and ClickUp. A Slack slash com
 
 - Accepts the Slack slash command `/taskapp` at `POST /slack/commands/clickup-task`.
 - Verifies Slack requests with the Slack signing secret.
-- Parses task details from the command text.
-- Creates a task in a configured ClickUp List.
-- Supports ClickUp assignees and custom tags.
+- Lets integrations be connected/configured at runtime through `GET /setup`.
+- Stores runtime connection settings in `data/connections.json`.
+- Creates ClickUp tasks with priority, due date, assignees, and tags.
 - Returns one ephemeral Slack confirmation for slash-command requests.
 - Exposes `POST /api/create-clickup-task` for direct testing; this endpoint creates a ClickUp task and posts a Slack message.
 - Exposes `GET /health` and `GET /demo` for live inspection.
@@ -27,8 +27,8 @@ Example Slack command:
   - Slash command named `/taskapp`.
   - Request URL pointing to this app's `/slack/commands/clickup-task` endpoint.
   - Signing secret for request verification.
-- A ClickUp personal token or OAuth access token.
-- A ClickUp List ID.
+  - OAuth redirect URL pointing to `/oauth/slack/callback`.
+- A ClickUp OAuth app with redirect URL pointing to `/oauth/clickup/callback`.
 
 ## Local setup
 
@@ -38,19 +38,28 @@ Create a `.env` file:
 cp .env.example .env
 ```
 
-Fill in:
+Fill in app-level values:
 
 ```bash
 PORT=3000
-SLACK_BOT_TOKEN=xoxb-your-token
+APP_BASE_URL=http://localhost:3000
+DATA_FILE=data/connections.json
 SLACK_SIGNING_SECRET=your-signing-secret
+SLACK_CLIENT_ID=your-slack-client-id
+SLACK_CLIENT_SECRET=your-slack-client-secret
+CLICKUP_CLIENT_ID=your-clickup-client-id
+CLICKUP_CLIENT_SECRET=your-clickup-client-secret
+```
+
+Optional local fallback values still work for quick testing without OAuth:
+
+```bash
+SLACK_BOT_TOKEN=xoxb-your-token
 SLACK_DEFAULT_CHANNEL_ID=C1234567890
 CLICKUP_TOKEN=pk_your-token
 CLICKUP_LIST_ID=901714346157
 CLICKUP_ASSIGNEE_ALIASES=jay:32644579,alex:12345678
 ```
-
-`CLICKUP_ASSIGNEE_ALIASES` lets the Slack command use friendly names instead of raw ClickUp user IDs. You can also pass numeric ClickUp user IDs directly.
 
 Start the server:
 
@@ -64,15 +73,58 @@ Check health:
 curl http://localhost:3000/health
 ```
 
-Inspect the demo metadata:
+Open setup:
+
+```text
+http://localhost:3000/setup
+```
+
+Inspect demo metadata:
 
 ```bash
 curl http://localhost:3000/demo
 ```
 
+## Runtime connection setup
+
+The setup page lets you connect/configure integrations without editing code or redeploying for each new connection.
+
+Slack redirect URL:
+
+```text
+http://localhost:3000/oauth/slack/callback
+```
+
+ClickUp redirect URL:
+
+```text
+http://localhost:3000/oauth/clickup/callback
+```
+
+For deployed Render:
+
+```text
+https://YOUR_RENDER_APP.onrender.com/oauth/slack/callback
+https://YOUR_RENDER_APP.onrender.com/oauth/clickup/callback
+```
+
+Setup flow:
+
+1. Open `/setup`.
+2. Install Slack.
+3. Connect ClickUp.
+4. Save ClickUp List ID, default Slack channel, and assignee aliases.
+5. Use `/taskapp` in Slack.
+
+Assignee aliases use this format:
+
+```text
+Thomas:32644579,Princess:32644580
+```
+
 ## Direct workflow test
 
-This endpoint is useful before configuring the Slack slash command. It creates a ClickUp task and posts a message to Slack.
+This endpoint is useful before configuring the Slack slash command. It creates a ClickUp task and posts a message to Slack. It uses a runtime connection when available, otherwise the optional env fallback.
 
 ```bash
 curl --request POST \
@@ -89,12 +141,21 @@ curl --request POST \
   }'
 ```
 
+With a specific runtime connection:
+
+```json
+{
+  "connectionId": "runtime-connection-id",
+  "name": "Direct API test task"
+}
+```
+
 Expected result:
 
 - A task is created in ClickUp.
 - The task is assigned and tagged when `assignee`/`assignees` and `tags` are supplied.
 - A message is posted to Slack.
-- The API returns JSON with the ClickUp task ID, task URL, and Slack message timestamp.
+- The API returns JSON with the connection used, ClickUp task ID, task URL, and Slack message timestamp.
 
 ## Slack slash command setup
 
@@ -126,7 +187,7 @@ Help and validation examples:
 Supported command fields:
 
 ```text
-assign: ClickUp user ID or alias from CLICKUP_ASSIGNEE_ALIASES
+assign: ClickUp user ID or alias configured in /setup
 assignee: same as assign
 assignees: comma-separated aliases or ClickUp user IDs
 tags: comma-separated ClickUp tags
@@ -137,22 +198,19 @@ description: task description
 
 ## Local tunnel testing
 
-Cloudflare Tunnel works well for local Slack testing:
+Cloudflare Tunnel is only needed if Slack or OAuth providers must call your local machine.
 
 ```bash
 cloudflared tunnel --protocol http2 --url http://localhost:3000
 ```
 
-Use the generated URL in Slack:
+Use the generated URL for:
 
 ```text
-https://YOUR_TRYCLOUDFLARE_URL/slack/commands/clickup-task
-```
-
-Then test:
-
-```text
-/taskapp Local tunnel test | assign: jay | tags: tunnel,demo | priority: high | due: tomorrow
+SLACK Request URL: https://YOUR_TRYCLOUDFLARE_URL/slack/commands/clickup-task
+Slack OAuth redirect: https://YOUR_TRYCLOUDFLARE_URL/oauth/slack/callback
+ClickUp OAuth redirect: https://YOUR_TRYCLOUDFLARE_URL/oauth/clickup/callback
+APP_BASE_URL=https://YOUR_TRYCLOUDFLARE_URL
 ```
 
 ## Render deployment
@@ -167,11 +225,22 @@ Build Command: npm install
 Start Command: npm start
 ```
 
-Set these environment variables in Render:
+Set these app-level environment variables in Render:
+
+```text
+APP_BASE_URL
+DATA_FILE
+SLACK_CLIENT_ID
+SLACK_CLIENT_SECRET
+SLACK_SIGNING_SECRET
+CLICKUP_CLIENT_ID
+CLICKUP_CLIENT_SECRET
+```
+
+Optional fallback env vars:
 
 ```text
 SLACK_BOT_TOKEN
-SLACK_SIGNING_SECRET
 SLACK_DEFAULT_CHANNEL_ID
 CLICKUP_TOKEN
 CLICKUP_LIST_ID
@@ -187,18 +256,21 @@ https://YOUR_RENDER_APP.onrender.com/slack/commands/clickup-task
 Public inspection endpoints:
 
 ```text
+https://YOUR_RENDER_APP.onrender.com/setup
 https://YOUR_RENDER_APP.onrender.com/health
 https://YOUR_RENDER_APP.onrender.com/demo
 ```
 
 If using Render's free tier, open `/health` shortly before the live demo to wake the service.
 
+For persistent runtime connections on Render, attach a persistent disk and point `DATA_FILE` at that disk path. Without a persistent disk, `data/connections.json` may be lost on redeploy/restart.
+
 ## Demo script
 
 Short explanation:
 
 ```text
-This app connects Slack and ClickUp. Slack sends a signed slash-command webhook to my Node server. The server verifies the request, parses the task details, creates a task in ClickUp through the ClickUp API, and returns one ephemeral Slack confirmation with the task URL. I also included a direct API endpoint plus health and demo endpoints for live inspection.
+This app connects Slack and ClickUp. Slack sends a signed slash-command webhook to my Node server. The server verifies the request, resolves the connected Slack team to a runtime ClickUp connection, parses the task details, creates a task in ClickUp, and returns one ephemeral Slack confirmation with the task URL. I also included a setup page, direct API endpoint, health endpoint, and demo endpoint for live inspection.
 ```
 
 Live demo command:
@@ -207,21 +279,14 @@ Live demo command:
 /taskapp Render demo task | assign: jay | tags: render,demo | priority: high | due: tomorrow | description: Created during the FDE debrief
 ```
 
-## Screenshots
-
-Add final screenshots in `screenshots/` before submission:
-
-- Slack command success response.
-- ClickUp task created.
-- `/health` or `/demo` response.
-
 ## Error handling
 
 The app gracefully handles:
 
 - Missing task name.
-- Missing ClickUp token or list ID.
-- Missing Slack bot token.
+- Missing runtime connection.
+- Missing ClickUp token or list ID for a connection.
+- Missing Slack bot token for a connection.
 - Unknown ClickUp assignee alias.
 - ClickUp API errors.
 - Slack API errors.
@@ -230,13 +295,14 @@ The app gracefully handles:
 ## Security notes
 
 - `.env` is ignored by Git and should never be committed.
+- `data/` is ignored by Git because it can contain runtime tokens.
 - `.env.example` is safe to commit because it contains placeholders only.
-- Rotate Slack and ClickUp tokens before final deployment or public submission if they were shared during testing.
+- App-level OAuth client secrets stay in environment variables.
+- Runtime integration tokens are stored in the connection store for this take-home. A production version should use encrypted storage.
 
 ## Assumptions
 
-- This demo uses environment variables for Slack and ClickUp credentials.
+- This demo uses a lightweight JSON file instead of a database.
 - The Slack command name is `/taskapp`.
-- Assignee aliases are configured through `CLICKUP_ASSIGNEE_ALIASES`.
-- The ClickUp List ID is configured once for the demo.
-- A production multi-tenant version would store Slack workspace IDs and ClickUp workspace/list selections per connection.
+- Runtime setup is intentionally simple server-rendered HTML.
+- A production multi-tenant version would add auth around `/setup`, encrypted token storage, and a database-backed connection table.

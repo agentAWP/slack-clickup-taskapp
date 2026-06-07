@@ -1,10 +1,14 @@
 const crypto = require("crypto");
+const fs = require("fs");
 const http = require("http");
+const path = require("path");
 const { URL } = require("url");
 
 loadDotEnv();
 
 const PORT = Number(process.env.PORT || 3000);
+const APP_BASE_URL = process.env.APP_BASE_URL || `http://localhost:${PORT}`;
+const DATA_FILE = process.env.DATA_FILE || path.join(process.cwd(), "data", "connections.json");
 const CLICKUP_API_BASE = "https://api.clickup.com/api/v2";
 const SLACK_API_BASE = "https://slack.com/api";
 
@@ -17,6 +21,7 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         app: "Slack to ClickUp Tasker",
         endpoints: [
+          "GET /setup",
           "GET /health",
           "GET /demo",
           "POST /api/create-clickup-task",
@@ -25,20 +30,68 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (req.method === "GET" && url.pathname === "/setup") {
+      return sendHtml(res, 200, renderSetupPage(url));
+    }
+
+    if (req.method === "GET" && url.pathname === "/setup/slack/install") {
+      return redirect(res, buildSlackInstallUrl());
+    }
+
+    if (req.method === "GET" && url.pathname === "/oauth/slack/callback") {
+      const result = await handleSlackOAuthCallback(url);
+      return sendHtml(res, result.ok ? 200 : 400, renderOAuthResult("Slack", result));
+    }
+
+    if (req.method === "GET" && url.pathname === "/setup/clickup/connect") {
+      return redirect(res, buildClickUpInstallUrl(url.searchParams.get("connectionId")));
+    }
+
+    if (req.method === "GET" && url.pathname === "/oauth/clickup/callback") {
+      const result = await handleClickUpOAuthCallback(url);
+      return sendHtml(res, result.ok ? 200 : 400, renderOAuthResult("ClickUp", result));
+    }
+
+    if (req.method === "POST" && url.pathname === "/setup/connections") {
+      const rawBody = await readBody(req);
+      const form = new URLSearchParams(rawBody);
+      const result = saveConnectionSettings({
+        connectionId: form.get("connectionId"),
+        name: form.get("name"),
+        clickupListId: form.get("clickupListId"),
+        assigneeAliases: form.get("assigneeAliases"),
+        defaultSlackChannelId: form.get("defaultSlackChannelId")
+      });
+
+      if (!result.ok) {
+        return sendHtml(res, 400, renderOAuthResult("Connection settings", result));
+      }
+
+      return redirect(res, "/setup?saved=1");
+    }
+
     if (req.method === "GET" && url.pathname === "/demo") {
+      const store = loadConnectionStore();
       return sendJson(res, 200, {
         ok: true,
         app: "Slack to ClickUp Tasker",
         purpose: "Create ClickUp tasks from a Slack slash command.",
+        setup: {
+          inProductSetupUrl: `${APP_BASE_URL}/setup`,
+          runtimeConnections: store.connections.length,
+          connectionStorage: DATA_FILE
+        },
         sampleCommand: "/taskapp Review FDE submission | assign: jay | tags: demo,interview | priority: high | due: tomorrow",
         workflow: [
           "Slack sends a signed slash-command webhook to this app.",
           "The app verifies the Slack request signature.",
-          "The app parses task name, priority, due date, and description from the command text.",
+          "The app resolves the runtime connection for the Slack team.",
+          "The app parses task name, assignees, tags, priority, due date, and description.",
           "The app creates a task in the configured ClickUp List.",
           "The app returns one ephemeral Slack confirmation with the ClickUp task URL."
         ],
         endpoints: {
+          setup: "GET /setup",
           health: "GET /health",
           demo: "GET /demo",
           directWorkflowTest: "POST /api/create-clickup-task",
@@ -47,7 +100,7 @@ const server = http.createServer(async (req, res) => {
         commandSyntax: {
           command: "/taskapp",
           format: "/taskapp Task name | assign: jay | tags: bug,auth | priority: high | due: tomorrow | description: details",
-          assignees: "Use ClickUp user IDs directly or aliases from CLICKUP_ASSIGNEE_ALIASES.",
+          assignees: "Use ClickUp user IDs directly or aliases configured in /setup.",
           tags: "Comma-separated tags. The app always includes the default slack tag.",
           priorities: ["urgent", "high", "normal", "low"],
           dueDateExamples: ["today", "tomorrow", "2026-06-10"]
@@ -56,17 +109,33 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
+      const store = loadConnectionStore();
+      const fallback = buildEnvConnection();
       return sendJson(res, 200, {
         ok: true,
-        clickupConfigured: Boolean(process.env.CLICKUP_TOKEN && process.env.CLICKUP_LIST_ID),
-        slackConfigured: Boolean(process.env.SLACK_BOT_TOKEN),
-        slackSigningConfigured: Boolean(process.env.SLACK_SIGNING_SECRET)
+        appBaseUrl: APP_BASE_URL,
+        dataFile: DATA_FILE,
+        runtimeConnections: store.connections.length,
+        oauthConfigured: {
+          slack: Boolean(process.env.SLACK_CLIENT_ID && process.env.SLACK_CLIENT_SECRET && process.env.SLACK_SIGNING_SECRET),
+          clickup: Boolean(process.env.CLICKUP_CLIENT_ID && process.env.CLICKUP_CLIENT_SECRET)
+        },
+        fallbackConfigured: {
+          clickup: Boolean(fallback?.clickupToken && fallback?.clickupListId),
+          slack: Boolean(fallback?.slackBotToken),
+          slackSigning: Boolean(process.env.SLACK_SIGNING_SECRET)
+        }
       });
     }
 
     if (req.method === "POST" && url.pathname === "/api/create-clickup-task") {
       const body = await readBody(req);
       const payload = parseJson(body);
+      const connection = findConnectionForRequest({
+        connectionId: payload.connectionId,
+        teamId: payload.teamId,
+        allowDefault: true
+      });
       const result = await runTaskWorkflow({
         taskName: payload.name,
         description: payload.description,
@@ -74,8 +143,9 @@ const server = http.createServer(async (req, res) => {
         due: payload.due,
         assignees: payload.assignees || payload.assignee,
         tags: payload.tags,
-        slackChannelId: payload.channel || process.env.SLACK_DEFAULT_CHANNEL_ID,
-        source: "api"
+        slackChannelId: payload.channel,
+        source: "api",
+        connection
       });
 
       return sendJson(res, 200, result);
@@ -110,6 +180,11 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
+      const connection = findConnectionForRequest({
+        teamId: form.get("team_id"),
+        allowDefault: false
+      });
+
       const result = await runTaskWorkflow({
         taskName: parsed.taskName,
         description: parsed.description || `Created from Slack by ${form.get("user_name") || form.get("user_id") || "unknown user"}.`,
@@ -120,14 +195,15 @@ const server = http.createServer(async (req, res) => {
         slackChannelId: form.get("channel_id"),
         source: "slack_command",
         slackUserId: form.get("user_id"),
-        postSlackConfirmation: false
+        postSlackConfirmation: false,
+        connection
       });
 
       return sendJson(res, 200, {
         response_type: "ephemeral",
         text: result.ok
           ? buildSlackConfirmation(result)
-          : `Could not create ClickUp task: ${result.error}`,
+          : `${result.error}\nSetup: ${APP_BASE_URL}/setup`,
         workflow: result
       });
     }
@@ -149,15 +225,16 @@ server.listen(PORT, () => {
 async function runTaskWorkflow(input) {
   const validationError = validateWorkflowInput(input);
   if (validationError) {
-    return { ok: false, error: validationError };
+    return { ok: false, source: input.source, error: validationError };
   }
 
-  const assignees = resolveClickUpAssignees(input.assignees);
+  const assignees = resolveClickUpAssignees(input.assignees, input.connection.assigneeAliases);
   if (!assignees.ok) {
     return { ok: false, source: input.source, error: assignees.error };
   }
 
   const tags = normalizeTags(input.tags);
+  const slackChannelId = input.slackChannelId || input.connection.defaultSlackChannelId;
 
   try {
     const clickupTask = await createClickUpTask(input, {
@@ -167,7 +244,8 @@ async function runTaskWorkflow(input) {
     const slackMessage = input.postSlackConfirmation === false
       ? { skipped: true, reason: "Slash command response is used as the Slack confirmation." }
       : await postSlackMessage({
-        channel: input.slackChannelId,
+        connection: input.connection,
+        channel: slackChannelId,
         text: [
           `ClickUp task created: ${clickupTask.name}`,
           clickupTask.url,
@@ -180,13 +258,14 @@ async function runTaskWorkflow(input) {
     return {
       ok: true,
       source: input.source,
+      connection: sanitizeConnection(input.connection),
       requested: {
         taskName: input.taskName,
         priority: normalizePriority(input.priority).label,
         due: input.due || null,
         assignees: assignees.labels,
         tags,
-        slackChannelId: input.slackChannelId || null
+        slackChannelId: slackChannelId || null
       },
       clickupTask,
       slackMessage
@@ -195,15 +274,17 @@ async function runTaskWorkflow(input) {
     return {
       ok: false,
       source: input.source,
+      connection: sanitizeConnection(input.connection),
       error: error.message
     };
   }
 }
 
 function validateWorkflowInput(input) {
-  if (!process.env.CLICKUP_TOKEN) return "Missing CLICKUP_TOKEN.";
-  if (!process.env.CLICKUP_LIST_ID) return "Missing CLICKUP_LIST_ID.";
-  if (!process.env.SLACK_BOT_TOKEN) return "Missing SLACK_BOT_TOKEN.";
+  if (!input.connection) return "No integration connection found. Connect Slack and ClickUp in the setup page.";
+  if (!input.connection.clickupToken) return "Missing ClickUp token for this connection.";
+  if (!input.connection.clickupListId) return "Missing ClickUp List ID for this connection.";
+  if (!input.connection.slackBotToken) return "Missing Slack bot token for this connection.";
   if (!input.taskName || !input.taskName.trim()) return "Missing task name.";
   return null;
 }
@@ -222,10 +303,10 @@ async function createClickUpTask(input, options = {}) {
   const dueDate = parseDueDate(input.due);
   if (dueDate) body.due_date = dueDate;
 
-  const response = await fetch(`${CLICKUP_API_BASE}/list/${process.env.CLICKUP_LIST_ID}/task`, {
+  const response = await fetch(`${CLICKUP_API_BASE}/list/${input.connection.clickupListId}/task`, {
     method: "POST",
     headers: {
-      Authorization: process.env.CLICKUP_TOKEN,
+      Authorization: input.connection.clickupToken,
       "Content-Type": "application/json"
     },
     body: JSON.stringify(body)
@@ -254,7 +335,7 @@ async function createClickUpTask(input, options = {}) {
   };
 }
 
-async function postSlackMessage({ channel, text }) {
+async function postSlackMessage({ connection, channel, text }) {
   if (!channel) {
     return { skipped: true, reason: "No Slack channel provided." };
   }
@@ -262,7 +343,7 @@ async function postSlackMessage({ channel, text }) {
   const response = await fetch(`${SLACK_API_BASE}/chat.postMessage`, {
     method: "POST",
     headers: {
-      Authorization: `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+      Authorization: `Bearer ${connection.slackBotToken}`,
       "Content-Type": "application/json; charset=utf-8"
     },
     body: JSON.stringify({ channel, text })
@@ -279,6 +360,342 @@ async function postSlackMessage({ channel, text }) {
     channel: data.channel,
     ts: data.ts
   };
+}
+
+function findConnectionForRequest({ connectionId, teamId, allowDefault }) {
+  const store = loadConnectionStore();
+  const connections = store.connections.map(normalizeStoredConnection);
+
+  if (connectionId) {
+    return connections.find((connection) => connection.id === connectionId) || null;
+  }
+
+  if (teamId) {
+    const match = connections.find((connection) => connection.slackTeamId === teamId);
+    if (match) return match;
+  }
+
+  if (allowDefault && connections.length) {
+    return connections[0];
+  }
+
+  return buildEnvConnection();
+}
+
+function buildEnvConnection() {
+  if (!process.env.CLICKUP_TOKEN || !process.env.CLICKUP_LIST_ID || !process.env.SLACK_BOT_TOKEN) {
+    return null;
+  }
+
+  return {
+    id: "env-fallback",
+    name: "Environment fallback",
+    source: "env",
+    slackTeamId: null,
+    slackTeamName: null,
+    slackBotToken: process.env.SLACK_BOT_TOKEN,
+    clickupToken: process.env.CLICKUP_TOKEN,
+    clickupListId: process.env.CLICKUP_LIST_ID,
+    assigneeAliases: process.env.CLICKUP_ASSIGNEE_ALIASES || "",
+    defaultSlackChannelId: process.env.SLACK_DEFAULT_CHANNEL_ID || null
+  };
+}
+
+function loadConnectionStore() {
+  try {
+    if (!fs.existsSync(DATA_FILE)) return { connections: [] };
+    const data = JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+    return { connections: Array.isArray(data.connections) ? data.connections : [] };
+  } catch {
+    return { connections: [] };
+  }
+}
+
+function saveConnectionStore(store) {
+  fs.mkdirSync(path.dirname(DATA_FILE), { recursive: true });
+  fs.writeFileSync(DATA_FILE, `${JSON.stringify({ connections: store.connections }, null, 2)}\n`);
+}
+
+function upsertConnection(update) {
+  const store = loadConnectionStore();
+  const existingIndex = store.connections.findIndex((connection) =>
+    connection.id === update.id ||
+    (update.slackTeamId && connection.slackTeamId === update.slackTeamId)
+  );
+  const existing = existingIndex >= 0 ? store.connections[existingIndex] : {};
+  const connection = {
+    ...existing,
+    ...update,
+    id: existing.id || update.id || crypto.randomUUID(),
+    updatedAt: new Date().toISOString(),
+    createdAt: existing.createdAt || new Date().toISOString()
+  };
+
+  if (existingIndex >= 0) {
+    store.connections[existingIndex] = connection;
+  } else {
+    store.connections.push(connection);
+  }
+
+  saveConnectionStore(store);
+  return normalizeStoredConnection(connection);
+}
+
+function normalizeStoredConnection(connection) {
+  return {
+    id: connection.id,
+    name: connection.name || connection.slackTeamName || "Runtime connection",
+    source: "runtime",
+    slackTeamId: connection.slackTeamId || null,
+    slackTeamName: connection.slackTeamName || null,
+    slackBotToken: connection.slackBotToken || null,
+    clickupToken: connection.clickupToken || null,
+    clickupListId: connection.clickupListId || null,
+    assigneeAliases: connection.assigneeAliases || "",
+    defaultSlackChannelId: connection.defaultSlackChannelId || null,
+    createdAt: connection.createdAt || null,
+    updatedAt: connection.updatedAt || null
+  };
+}
+
+function sanitizeConnection(connection) {
+  if (!connection) return null;
+  return {
+    id: connection.id,
+    name: connection.name,
+    source: connection.source,
+    slackTeamId: connection.slackTeamId,
+    slackTeamName: connection.slackTeamName,
+    clickupListId: connection.clickupListId,
+    hasSlackBotToken: Boolean(connection.slackBotToken),
+    hasClickUpToken: Boolean(connection.clickupToken),
+    hasAssigneeAliases: Boolean(connection.assigneeAliases)
+  };
+}
+
+function saveConnectionSettings({ connectionId, name, clickupListId, assigneeAliases, defaultSlackChannelId }) {
+  if (!connectionId) return { ok: false, error: "Missing connectionId." };
+  const connection = findConnectionForRequest({ connectionId, allowDefault: false });
+  if (!connection || connection.source === "env") return { ok: false, error: "Runtime connection not found." };
+
+  const updated = upsertConnection({
+    id: connection.id,
+    name: name || connection.name,
+    clickupListId: clickupListId || connection.clickupListId,
+    assigneeAliases: assigneeAliases || "",
+    defaultSlackChannelId: defaultSlackChannelId || ""
+  });
+
+  return { ok: true, connection: sanitizeConnection(updated) };
+}
+
+function buildSlackInstallUrl() {
+  const clientId = process.env.SLACK_CLIENT_ID;
+  if (!clientId) return "/setup?error=missing_slack_client_id";
+  const authorizeUrl = new URL("https://slack.com/oauth/v2/authorize");
+  authorizeUrl.searchParams.set("client_id", clientId);
+  authorizeUrl.searchParams.set("scope", "commands,chat:write");
+  authorizeUrl.searchParams.set("redirect_uri", `${APP_BASE_URL}/oauth/slack/callback`);
+  return authorizeUrl.toString();
+}
+
+async function handleSlackOAuthCallback(url) {
+  const code = url.searchParams.get("code");
+  if (!code) return { ok: false, error: "Missing Slack OAuth code." };
+  if (!process.env.SLACK_CLIENT_ID || !process.env.SLACK_CLIENT_SECRET) {
+    return { ok: false, error: "Missing SLACK_CLIENT_ID or SLACK_CLIENT_SECRET." };
+  }
+
+  const body = new URLSearchParams({
+    client_id: process.env.SLACK_CLIENT_ID,
+    client_secret: process.env.SLACK_CLIENT_SECRET,
+    code,
+    redirect_uri: `${APP_BASE_URL}/oauth/slack/callback`
+  });
+
+  const response = await fetch(`${SLACK_API_BASE}/oauth.v2.access`, {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body
+  });
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || !data.ok) {
+    return { ok: false, error: `Slack OAuth failed: ${data.error || response.statusText}` };
+  }
+
+  const connection = upsertConnection({
+    name: data.team?.name || "Slack workspace",
+    slackTeamId: data.team?.id,
+    slackTeamName: data.team?.name,
+    slackBotToken: data.access_token
+  });
+
+  return {
+    ok: true,
+    message: "Slack connected.",
+    connection: sanitizeConnection(connection)
+  };
+}
+
+function buildClickUpInstallUrl(connectionId) {
+  const clientId = process.env.CLICKUP_CLIENT_ID;
+  if (!clientId) return "/setup?error=missing_clickup_client_id";
+  const authorizeUrl = new URL("https://app.clickup.com/api");
+  authorizeUrl.searchParams.set("client_id", clientId);
+  authorizeUrl.searchParams.set("redirect_uri", `${APP_BASE_URL}/oauth/clickup/callback`);
+  if (connectionId) authorizeUrl.searchParams.set("state", connectionId);
+  return authorizeUrl.toString();
+}
+
+async function handleClickUpOAuthCallback(url) {
+  const code = url.searchParams.get("code");
+  const connectionId = url.searchParams.get("state");
+  if (!code) return { ok: false, error: "Missing ClickUp OAuth code." };
+  if (!process.env.CLICKUP_CLIENT_ID || !process.env.CLICKUP_CLIENT_SECRET) {
+    return { ok: false, error: "Missing CLICKUP_CLIENT_ID or CLICKUP_CLIENT_SECRET." };
+  }
+
+  const response = await fetch(`${CLICKUP_API_BASE}/oauth/token`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      client_id: process.env.CLICKUP_CLIENT_ID,
+      client_secret: process.env.CLICKUP_CLIENT_SECRET,
+      code
+    })
+  });
+  const data = await response.json().catch(() => ({}));
+
+  if (!response.ok || !data.access_token) {
+    return { ok: false, error: `ClickUp OAuth failed: ${data.err || data.error || response.statusText}` };
+  }
+
+  const store = loadConnectionStore();
+  const fallbackId = store.connections[0]?.id || crypto.randomUUID();
+  const connection = upsertConnection({
+    id: connectionId || fallbackId,
+    name: store.connections.find((item) => item.id === (connectionId || fallbackId))?.name || "Runtime connection",
+    clickupToken: data.access_token
+  });
+
+  return {
+    ok: true,
+    message: "ClickUp connected. Add the ClickUp List ID on the setup page.",
+    connection: sanitizeConnection(connection)
+  };
+}
+
+function renderSetupPage(url) {
+  const store = loadConnectionStore();
+  const connections = store.connections.map(normalizeStoredConnection);
+  const fallback = buildEnvConnection();
+  const error = url.searchParams.get("error");
+  const saved = url.searchParams.get("saved");
+
+  return htmlPage("TaskApp Setup", `
+    <h1>TaskApp Setup</h1>
+    <p>Connect Slack and ClickUp, then configure the ClickUp List and assignee aliases without editing code or redeploying.</p>
+    ${error ? `<p class="error">Setup error: ${escapeHtml(error)}</p>` : ""}
+    ${saved ? `<p class="success">Connection settings saved.</p>` : ""}
+
+    <section>
+      <h2>OAuth App Status</h2>
+      <ul>
+        <li>Slack OAuth app: ${statusText(process.env.SLACK_CLIENT_ID && process.env.SLACK_CLIENT_SECRET)}</li>
+        <li>Slack signing secret: ${statusText(process.env.SLACK_SIGNING_SECRET)}</li>
+        <li>ClickUp OAuth app: ${statusText(process.env.CLICKUP_CLIENT_ID && process.env.CLICKUP_CLIENT_SECRET)}</li>
+        <li>Runtime connections: ${connections.length}</li>
+        <li>Environment fallback: ${statusText(fallback)}</li>
+      </ul>
+    </section>
+
+    <section>
+      <h2>Connect Integrations</h2>
+      <p>
+        <a class="button" href="/setup/slack/install">Install Slack</a>
+        <a class="button" href="/setup/clickup/connect">Connect ClickUp</a>
+      </p>
+      <p class="muted">Slack redirect URL: <code>${APP_BASE_URL}/oauth/slack/callback</code></p>
+      <p class="muted">ClickUp redirect URL: <code>${APP_BASE_URL}/oauth/clickup/callback</code></p>
+    </section>
+
+    <section>
+      <h2>Runtime Connections</h2>
+      ${connections.length ? connections.map(renderConnectionForm).join("") : "<p>No runtime connections yet. Install Slack and connect ClickUp to create one.</p>"}
+    </section>
+  `);
+}
+
+function renderConnectionForm(connection) {
+  return `
+    <form method="POST" action="/setup/connections">
+      <input type="hidden" name="connectionId" value="${escapeHtml(connection.id)}" />
+      <h3>${escapeHtml(connection.name)}</h3>
+      <p class="muted">ID: <code>${escapeHtml(connection.id)}</code></p>
+      <p>Slack team: ${escapeHtml(connection.slackTeamName || connection.slackTeamId || "Not connected")}</p>
+      <p>Slack bot token: ${statusText(connection.slackBotToken)}</p>
+      <p>ClickUp token: ${statusText(connection.clickupToken)}</p>
+      <p><a href="/setup/clickup/connect?connectionId=${encodeURIComponent(connection.id)}">Connect ClickUp for this connection</a></p>
+      <label>
+        Display name
+        <input name="name" value="${escapeHtml(connection.name)}" />
+      </label>
+      <label>
+        ClickUp List ID
+        <input name="clickupListId" value="${escapeHtml(connection.clickupListId || "")}" placeholder="901714346157" />
+      </label>
+      <label>
+        Default Slack Channel ID
+        <input name="defaultSlackChannelId" value="${escapeHtml(connection.defaultSlackChannelId || "")}" placeholder="C1234567890" />
+      </label>
+      <label>
+        Assignee aliases
+        <input name="assigneeAliases" value="${escapeHtml(connection.assigneeAliases || "")}" placeholder="Thomas:32644579,Princess:32644580" />
+      </label>
+      <button type="submit">Save Connection</button>
+    </form>
+  `;
+}
+
+function renderOAuthResult(provider, result) {
+  return htmlPage(`${provider} Setup`, `
+    <h1>${escapeHtml(provider)} Setup</h1>
+    <p class="${result.ok ? "success" : "error"}">${escapeHtml(result.message || result.error)}</p>
+    ${result.connection ? `<pre>${escapeHtml(JSON.stringify(result.connection, null, 2))}</pre>` : ""}
+    <p><a href="/setup">Back to setup</a></p>
+  `);
+}
+
+function htmlPage(title, body) {
+  return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>${escapeHtml(title)}</title>
+  <style>
+    body { color: #1f2937; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; margin: 0; padding: 32px; }
+    main { max-width: 920px; margin: 0 auto; }
+    section, form { border: 1px solid #d1d5db; border-radius: 8px; margin: 20px 0; padding: 18px; }
+    label { display: block; font-weight: 600; margin: 14px 0; }
+    input { border: 1px solid #9ca3af; border-radius: 6px; box-sizing: border-box; display: block; font: inherit; margin-top: 6px; padding: 8px; width: 100%; }
+    button, .button { background: #111827; border: 0; border-radius: 6px; color: white; display: inline-block; font: inherit; margin-right: 8px; padding: 9px 12px; text-decoration: none; }
+    code, pre { background: #f3f4f6; border-radius: 6px; padding: 2px 4px; }
+    pre { overflow: auto; padding: 12px; }
+    .muted { color: #6b7280; }
+    .success { color: #047857; font-weight: 700; }
+    .error { color: #b91c1c; font-weight: 700; }
+  </style>
+</head>
+<body>
+  <main>${body}</main>
+</body>
+</html>`;
+}
+
+function statusText(value) {
+  return value ? "Configured" : "Missing";
 }
 
 function parseSlackCommand(text) {
@@ -308,7 +725,7 @@ function isHelpCommand(text) {
 function buildUsageText(commandName) {
   return [
     `Usage: ${commandName} Task name | assign: jay | tags: bug,auth | priority: high | due: tomorrow | description: details`,
-    "Assign: ClickUp user ID or alias from CLICKUP_ASSIGNEE_ALIASES",
+    "Assign: ClickUp user ID or alias configured in /setup",
     "Tags: comma-separated values",
     "Priorities: urgent, high, normal, low",
     "Due: today, tomorrow, or YYYY-MM-DD"
@@ -324,11 +741,11 @@ function buildSlackConfirmation(result) {
   ].filter(Boolean).join("\n");
 }
 
-function resolveClickUpAssignees(input) {
+function resolveClickUpAssignees(input, aliasesText) {
   const values = normalizeList(input);
   if (!values.length) return { ok: true, ids: [], labels: [] };
 
-  const aliases = parseAssigneeAliases();
+  const aliases = parseAssigneeAliases(aliasesText);
   const ids = [];
   const labels = [];
 
@@ -344,7 +761,7 @@ function resolveClickUpAssignees(input) {
     if (!aliases[alias]) {
       return {
         ok: false,
-        error: `Unknown assignee alias "${value}". Add it to CLICKUP_ASSIGNEE_ALIASES or use a ClickUp user ID.`
+        error: `Unknown assignee alias "${value}". Add it in /setup or use a ClickUp user ID.`
       };
     }
 
@@ -359,9 +776,9 @@ function resolveClickUpAssignees(input) {
   };
 }
 
-function parseAssigneeAliases() {
+function parseAssigneeAliases(aliasesText) {
   const aliases = {};
-  for (const pair of normalizeList(process.env.CLICKUP_ASSIGNEE_ALIASES)) {
+  for (const pair of normalizeList(aliasesText)) {
     const [rawName, rawId] = pair.split(":");
     const name = rawName?.trim().toLowerCase();
     const id = rawId?.trim();
@@ -474,9 +891,26 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload, null, 2));
 }
 
+function sendHtml(res, status, html) {
+  res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
+  res.end(html);
+}
+
+function redirect(res, location) {
+  res.writeHead(302, { Location: location });
+  res.end();
+}
+
+function escapeHtml(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
 function loadDotEnv() {
-  const fs = require("fs");
-  const path = require("path");
   const envPath = path.join(process.cwd(), ".env");
   if (!fs.existsSync(envPath)) return;
 
