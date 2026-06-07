@@ -7,9 +7,12 @@ Lightweight FDE take-home app that connects Slack and ClickUp. A Slack slash com
 - Accepts the Slack slash command `/taskapp` at `POST /slack/commands/clickup-task`.
 - Verifies Slack requests with the Slack signing secret.
 - Lets integrations be connected/configured at runtime through `GET /setup`.
+- Shows modal-style confirmations before redirecting to Slack or ClickUp OAuth.
 - Stores runtime connection settings in `data/connections.json`.
 - Creates ClickUp tasks with priority, due date, assignees, and tags.
 - Returns one ephemeral Slack confirmation for slash-command requests.
+- Provides `POST /api/run-demo` as a stable env-backed fallback demo path.
+- Provides `POST /api/test-connection` for testing a runtime connection.
 - Exposes `POST /api/create-clickup-task` for direct testing; this endpoint creates a ClickUp task and posts a Slack message.
 - Exposes `GET /health` and `GET /demo` for live inspection.
 
@@ -111,8 +114,8 @@ https://YOUR_RENDER_APP.onrender.com/oauth/clickup/callback
 Setup flow:
 
 1. Open `/setup`.
-2. Install Slack.
-3. Connect ClickUp.
+2. Click **Install Slack**, confirm the modal, and authorize Slack.
+3. Click **Connect ClickUp**, confirm the modal, and authorize ClickUp.
 4. Save ClickUp List ID, default Slack channel, and assignee aliases.
 5. Use `/taskapp` in Slack.
 
@@ -121,6 +124,12 @@ Assignee aliases use this format:
 ```text
 Thomas:32644579,Princess:32644580
 ```
+
+The setup page also includes:
+
+- **Run Demo**: uses the env fallback connection to create a known-good demo task.
+- **Test Runtime Connection**: creates a test task through the selected runtime connection.
+- **Clear Runtime Connections**: clears OAuth-created runtime connections without changing env fallback settings.
 
 ## Direct workflow test
 
@@ -261,6 +270,21 @@ https://YOUR_RENDER_APP.onrender.com/health
 https://YOUR_RENDER_APP.onrender.com/demo
 ```
 
+Fallback demo endpoint:
+
+```bash
+curl --request POST https://YOUR_RENDER_APP.onrender.com/api/run-demo
+```
+
+Runtime connection test endpoint:
+
+```bash
+curl --request POST \
+  --url "https://YOUR_RENDER_APP.onrender.com/api/test-connection" \
+  --header "Content-Type: application/json" \
+  --data '{"connectionId":"runtime-connection-id","tags":["runtime","test"]}'
+```
+
 If using Render's free tier, open `/health` shortly before the live demo to wake the service.
 
 For persistent runtime connections on Render, attach a persistent disk and point `DATA_FILE` at that disk path. Without a persistent disk, `data/connections.json` may be lost on redeploy/restart.
@@ -271,6 +295,12 @@ Short explanation:
 
 ```text
 This app connects Slack and ClickUp. Slack sends a signed slash-command webhook to my Node server. The server verifies the request, resolves the connected Slack team to a runtime ClickUp connection, parses the task details, creates a task in ClickUp, and returns one ephemeral Slack confirmation with the task URL. I also included a setup page, direct API endpoint, health endpoint, and demo endpoint for live inspection.
+```
+
+Fallback line if OAuth setup is unavailable during the debrief:
+
+```text
+I also kept a Run Demo fallback that uses an env-configured connection, so the core Slack/ClickUp workflow can still be demonstrated reliably while the live OAuth setup remains visible in-product.
 ```
 
 Live demo command:

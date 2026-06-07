@@ -24,6 +24,8 @@ const server = http.createServer(async (req, res) => {
           "GET /setup",
           "GET /health",
           "GET /demo",
+          "POST /api/run-demo",
+          "POST /api/test-connection",
           "POST /api/create-clickup-task",
           "POST /slack/commands/clickup-task"
         ]
@@ -70,6 +72,11 @@ const server = http.createServer(async (req, res) => {
       return redirect(res, "/setup?saved=1");
     }
 
+    if (req.method === "POST" && url.pathname === "/setup/reset") {
+      saveConnectionStore({ connections: [] });
+      return redirect(res, "/setup?reset=1");
+    }
+
     if (req.method === "GET" && url.pathname === "/demo") {
       const store = loadConnectionStore();
       return sendJson(res, 200, {
@@ -94,6 +101,8 @@ const server = http.createServer(async (req, res) => {
           setup: "GET /setup",
           health: "GET /health",
           demo: "GET /demo",
+          runDemo: "POST /api/run-demo",
+          testConnection: "POST /api/test-connection",
           directWorkflowTest: "POST /api/create-clickup-task",
           slackSlashCommand: "POST /slack/commands/clickup-task"
         },
@@ -106,6 +115,47 @@ const server = http.createServer(async (req, res) => {
           dueDateExamples: ["today", "tomorrow", "2026-06-10"]
         }
       });
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/run-demo") {
+      const connection = buildEnvConnection();
+      const result = await runTaskWorkflow({
+        taskName: "TaskApp fallback demo task",
+        description: "Created from the Run Demo fallback endpoint.",
+        priority: "high",
+        due: "tomorrow",
+        assignees: "",
+        tags: ["demo", "fallback"],
+        source: "run_demo",
+        postSlackConfirmation: true,
+        connection
+      });
+
+      return sendJson(res, 200, result);
+    }
+
+    if (req.method === "POST" && url.pathname === "/api/test-connection") {
+      const body = await readBody(req);
+      const payload = body ? parseJson(body) : {};
+      const connection = findConnectionForRequest({
+        connectionId: payload.connectionId,
+        teamId: payload.teamId,
+        allowDefault: true
+      });
+      const result = await runTaskWorkflow({
+        taskName: payload.name || "TaskApp runtime connection test",
+        description: "Created from the Test Runtime Connection endpoint.",
+        priority: payload.priority || "normal",
+        due: payload.due || "tomorrow",
+        assignees: payload.assignees || payload.assignee,
+        tags: payload.tags || ["runtime", "test"],
+        slackChannelId: payload.channel,
+        source: "test_connection",
+        postSlackConfirmation: true,
+        connection
+      });
+
+      return sendJson(res, 200, result);
     }
 
     if (req.method === "GET" && url.pathname === "/health") {
@@ -592,12 +642,14 @@ function renderSetupPage(url) {
   const fallback = buildEnvConnection();
   const error = url.searchParams.get("error");
   const saved = url.searchParams.get("saved");
+  const reset = url.searchParams.get("reset");
 
   return htmlPage("TaskApp Setup", `
     <h1>TaskApp Setup</h1>
     <p>Connect Slack and ClickUp, then configure the ClickUp List and assignee aliases without editing code or redeploying.</p>
     ${error ? `<p class="error">Setup error: ${escapeHtml(error)}</p>` : ""}
     ${saved ? `<p class="success">Connection settings saved.</p>` : ""}
+    ${reset ? `<p class="success">Runtime connections cleared.</p>` : ""}
 
     <section>
       <h2>OAuth App Status</h2>
@@ -613,17 +665,48 @@ function renderSetupPage(url) {
     <section>
       <h2>Connect Integrations</h2>
       <p>
-        <a class="button" href="/setup/slack/install">Install Slack</a>
-        <a class="button" href="/setup/clickup/connect">Connect ClickUp</a>
+        <button type="button" onclick="openModal('slack-modal')">Install Slack</button>
+        <button type="button" onclick="openModal('clickup-modal')">Connect ClickUp</button>
       </p>
       <p class="muted">Slack redirect URL: <code>${APP_BASE_URL}/oauth/slack/callback</code></p>
       <p class="muted">ClickUp redirect URL: <code>${APP_BASE_URL}/oauth/clickup/callback</code></p>
     </section>
 
     <section>
+      <h2>Reliable Demo Fallback</h2>
+      <p>Use the existing env-configured Slack and ClickUp connection as a safe demo path if live OAuth setup is unavailable.</p>
+      <form class="inline-form" method="POST" action="/api/run-demo">
+        <button type="submit">Run Demo</button>
+      </form>
+    </section>
+
+    <section>
       <h2>Runtime Connections</h2>
       ${connections.length ? connections.map(renderConnectionForm).join("") : "<p>No runtime connections yet. Install Slack and connect ClickUp to create one.</p>"}
     </section>
+
+    <section>
+      <h2>Reset Runtime Connections</h2>
+      <p>This clears only OAuth-created runtime connections. It does not affect env fallback settings.</p>
+      <form class="inline-form" method="POST" action="/setup/reset" onsubmit="return confirm('Clear runtime connections? Env fallback will remain unchanged.');">
+        <button type="submit">Clear Runtime Connections</button>
+      </form>
+    </section>
+
+    ${renderOAuthModal({
+      id: "slack-modal",
+      title: "Install Slack",
+      body: "You will leave this page to authorize TaskApp in Slack. Slack will redirect back here after approval, and the app will store the Slack bot token as a runtime connection.",
+      href: "/setup/slack/install",
+      cta: "Continue to Slack"
+    })}
+    ${renderOAuthModal({
+      id: "clickup-modal",
+      title: "Connect ClickUp",
+      body: "You will leave this page to authorize TaskApp in ClickUp. ClickUp will redirect back here after approval. After that, save the ClickUp List ID and aliases on the connection card.",
+      href: "/setup/clickup/connect",
+      cta: "Continue to ClickUp"
+    })}
   `);
 }
 
@@ -636,7 +719,7 @@ function renderConnectionForm(connection) {
       <p>Slack team: ${escapeHtml(connection.slackTeamName || connection.slackTeamId || "Not connected")}</p>
       <p>Slack bot token: ${statusText(connection.slackBotToken)}</p>
       <p>ClickUp token: ${statusText(connection.clickupToken)}</p>
-      <p><a href="/setup/clickup/connect?connectionId=${encodeURIComponent(connection.id)}">Connect ClickUp for this connection</a></p>
+      <p><button type="button" onclick="openModal('clickup-${escapeHtml(connection.id)}')">Connect ClickUp for this connection</button></p>
       <label>
         Display name
         <input name="name" value="${escapeHtml(connection.name)}" />
@@ -655,6 +738,32 @@ function renderConnectionForm(connection) {
       </label>
       <button type="submit">Save Connection</button>
     </form>
+    ${renderOAuthModal({
+      id: `clickup-${connection.id}`,
+      title: "Connect ClickUp",
+      body: `This will attach the ClickUp OAuth token to ${connection.name}.`,
+      href: `/setup/clickup/connect?connectionId=${encodeURIComponent(connection.id)}`,
+      cta: "Continue to ClickUp"
+    })}
+    <form class="inline-form" method="POST" action="/api/test-connection">
+      <input type="hidden" name="connectionId" value="${escapeHtml(connection.id)}" />
+    </form>
+    <button type="button" onclick="testConnection('${escapeHtml(connection.id)}')">Test Runtime Connection</button>
+  `;
+}
+
+function renderOAuthModal({ id, title, body, href, cta }) {
+  return `
+    <div class="modal-backdrop" id="${escapeHtml(id)}" role="dialog" aria-modal="true" aria-labelledby="${escapeHtml(id)}-title">
+      <div class="modal">
+        <h2 id="${escapeHtml(id)}-title">${escapeHtml(title)}</h2>
+        <p>${escapeHtml(body)}</p>
+        <p class="modal-actions">
+          <a class="button" href="${escapeHtml(href)}">${escapeHtml(cta)}</a>
+          <button type="button" onclick="closeModal('${escapeHtml(id)}')">Cancel</button>
+        </p>
+      </div>
+    </div>
   `;
 }
 
@@ -686,7 +795,29 @@ function htmlPage(title, body) {
     .muted { color: #6b7280; }
     .success { color: #047857; font-weight: 700; }
     .error { color: #b91c1c; font-weight: 700; }
+    .inline-form { border: 0; margin: 0; padding: 0; }
+    .modal-backdrop { align-items: center; background: rgba(17, 24, 39, 0.58); display: none; inset: 0; justify-content: center; padding: 20px; position: fixed; z-index: 10; }
+    .modal-backdrop.is-open { display: flex; }
+    .modal { background: white; border-radius: 8px; box-shadow: 0 24px 72px rgba(0, 0, 0, 0.25); max-width: 520px; padding: 22px; width: 100%; }
+    .modal-actions { display: flex; gap: 8px; margin-bottom: 0; }
   </style>
+  <script>
+    function openModal(id) {
+      document.getElementById(id)?.classList.add("is-open");
+    }
+    function closeModal(id) {
+      document.getElementById(id)?.classList.remove("is-open");
+    }
+    async function testConnection(connectionId) {
+      const response = await fetch("/api/test-connection", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ connectionId: connectionId, tags: ["runtime", "test"] })
+      });
+      const data = await response.json();
+      alert(data.ok ? "Runtime connection test created: " + data.clickupTask.url : "Runtime connection test failed: " + data.error);
+    }
+  </script>
 </head>
 <body>
   <main>${body}</main>
