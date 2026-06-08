@@ -836,54 +836,111 @@ function renderSetupPage(url) {
   const error = url.searchParams.get("error");
   const saved = url.searchParams.get("saved");
   const reset = url.searchParams.get("reset");
+  const refreshed = url.searchParams.get("refreshed");
 
   return htmlPage("TaskApp Setup", `
-    <h1>TaskApp Setup</h1>
-    <p>Connect Slack and ClickUp, then configure the ClickUp List and assignee aliases without editing code or redeploying.</p>
+    <header class="page-header">
+      <div>
+        <h1>TaskApp</h1>
+        <p>Slack command to ClickUp task workflow.</p>
+      </div>
+      <a class="button secondary" href="/demo">View Demo Metadata</a>
+    </header>
     ${error ? `<p class="error">Setup error: ${escapeHtml(error)}</p>` : ""}
     ${saved ? `<p class="success">Connection settings saved.</p>` : ""}
     ${reset ? `<p class="success">Runtime connections cleared.</p>` : ""}
+    ${refreshed ? `<p class="success">Options refreshed from Slack and ClickUp.</p>` : ""}
 
-    <section>
-      <h2>OAuth App Status</h2>
-      <ul>
-        <li>Slack OAuth app: ${statusText(process.env.SLACK_CLIENT_ID && process.env.SLACK_CLIENT_SECRET)}</li>
-        <li>Slack signing secret: ${statusText(process.env.SLACK_SIGNING_SECRET)}</li>
-        <li>ClickUp OAuth app: ${statusText(process.env.CLICKUP_CLIENT_ID && process.env.CLICKUP_CLIENT_SECRET)}</li>
-        <li>Runtime connections: ${connections.length}</li>
-        <li>Environment fallback: ${statusText(fallback)}</li>
-      </ul>
+    <nav class="tabs" aria-label="Setup sections">
+      <button type="button" class="tab is-active" data-tab="workflow">Workflow</button>
+      <button type="button" class="tab" data-tab="connections">Connections</button>
+      <button type="button" class="tab" data-tab="test">Test</button>
+      <button type="button" class="tab" data-tab="demo-tools">Demo Tools</button>
+    </nav>
+
+    <section class="tab-panel is-active" id="workflow">
+      <div class="workflow-map">
+        <div class="node">
+          <strong>Slack</strong>
+          <span>/taskapp command</span>
+        </div>
+        <div class="arrow">→</div>
+        <div class="node">
+          <strong>TaskApp</strong>
+          <span>parse + map fields</span>
+        </div>
+        <div class="arrow">→</div>
+        <div class="node">
+          <strong>ClickUp</strong>
+          <span>create task</span>
+        </div>
+      </div>
+      <div class="grid">
+        <div class="card">
+          <h2>Trigger</h2>
+          <p>Slack sends a signed slash-command webhook to this app.</p>
+        </div>
+        <div class="card">
+          <h2>Mapped Fields</h2>
+          <p>Name, assignee, tags, priority, due date, and description.</p>
+        </div>
+        <div class="card">
+          <h2>Action</h2>
+          <p>Create a ClickUp task in the selected List and return a Slack confirmation.</p>
+        </div>
+      </div>
     </section>
 
-    <section>
-      <h2>Connect Integrations</h2>
-      <p>
-        <button type="button" onclick="openModal('slack-modal')">Install Slack</button>
-        <button type="button" onclick="openModal('clickup-modal')">Connect ClickUp</button>
-      </p>
-      <p class="muted">Slack redirect URL: <code>${APP_BASE_URL}/oauth/slack/callback</code></p>
-      <p class="muted">ClickUp redirect URL: <code>${APP_BASE_URL}/oauth/clickup/callback</code></p>
+    <section class="tab-panel" id="connections">
+      <div class="status-grid">
+        ${renderStatusCard("Slack OAuth App", process.env.SLACK_CLIENT_ID && process.env.SLACK_CLIENT_SECRET)}
+        ${renderStatusCard("Slack Signing", process.env.SLACK_SIGNING_SECRET)}
+        ${renderStatusCard("ClickUp OAuth App", process.env.CLICKUP_CLIENT_ID && process.env.CLICKUP_CLIENT_SECRET)}
+        ${renderStatusCard("Runtime Connections", connections.length, `${connections.length} configured`)}
+        ${renderStatusCard("Env Fallback", fallback)}
+      </div>
+      <div class="card">
+        <h2>Connect Integrations</h2>
+        <p>
+          <button type="button" onclick="openModal('slack-modal')">Install Slack</button>
+          <button type="button" onclick="openModal('clickup-modal')">Connect ClickUp</button>
+        </p>
+        <details>
+          <summary>OAuth redirect URLs</summary>
+          <p class="muted">Slack: <code>${APP_BASE_URL}/oauth/slack/callback</code></p>
+          <p class="muted">ClickUp: <code>${APP_BASE_URL}/oauth/clickup/callback</code></p>
+        </details>
+      </div>
+      ${connections.length ? connections.map(renderConnectionForm).join("") : `<div class="card"><p>No runtime connections yet. Install Slack and connect ClickUp to create one.</p></div>`}
     </section>
 
-    <section>
-      <h2>Reliable Demo Fallback</h2>
-      <p>Use the existing env-configured Slack and ClickUp connection as a safe demo path if live OAuth setup is unavailable.</p>
-      <form class="inline-form" method="POST" action="/api/run-demo">
-        <button type="submit">Run Demo</button>
-      </form>
+    <section class="tab-panel" id="test">
+      <div class="card">
+        <h2>Test From Slack</h2>
+        <p>Use this command in Slack after saving a runtime connection.</p>
+        <pre>/taskapp Runtime test | assign: thomas | tags: oauth,demo | priority: high | due: tomorrow</pre>
+      </div>
+      <div class="card">
+        <h2>Test Runtime Connection</h2>
+        <p>Use the button on a connection card to create a test task with that saved runtime connection.</p>
+      </div>
     </section>
 
-    <section>
-      <h2>Runtime Connections</h2>
-      ${connections.length ? connections.map(renderConnectionForm).join("") : "<p>No runtime connections yet. Install Slack and connect ClickUp to create one.</p>"}
-    </section>
-
-    <section>
-      <h2>Reset Runtime Connections</h2>
-      <p>This clears only OAuth-created runtime connections. It does not affect env fallback settings.</p>
-      <form class="inline-form" method="POST" action="/setup/reset" onsubmit="return confirm('Clear runtime connections? Env fallback will remain unchanged.');">
-        <button type="submit">Clear Runtime Connections</button>
-      </form>
+    <section class="tab-panel" id="demo-tools">
+      <div class="card">
+        <h2>Fallback Backend Test</h2>
+        <p>This bypasses the Slack command flow and uses env fallback credentials. It is only for troubleshooting or debrief backup.</p>
+        <form class="inline-form" method="POST" action="/api/run-demo" onsubmit="return confirm('This will create a real ClickUp task and post to Slack without going through /taskapp. Continue?');">
+          <button type="submit">Run Backend Fallback Test</button>
+        </form>
+      </div>
+      <div class="card danger-zone">
+        <h2>Reset Runtime Connections</h2>
+        <p>This clears only OAuth-created runtime connections. It does not affect env fallback settings.</p>
+        <form class="inline-form" method="POST" action="/setup/reset" onsubmit="return confirm('Clear runtime connections? Env fallback will remain unchanged.');">
+          <button type="submit">Clear Runtime Connections</button>
+        </form>
+      </div>
     </section>
 
     ${renderOAuthModal({
@@ -903,6 +960,17 @@ function renderSetupPage(url) {
   `);
 }
 
+function renderStatusCard(label, value, detail) {
+  const ok = Boolean(value);
+  return `
+    <div class="status-card">
+      <span class="badge ${ok ? "ok" : "missing"}">${ok ? "Ready" : "Missing"}</span>
+      <strong>${escapeHtml(label)}</strong>
+      <span>${escapeHtml(detail || (ok ? "Configured" : "Needs setup"))}</span>
+    </div>
+  `;
+}
+
 function renderConnectionForm(connection) {
   const channelOptions = renderSelectOptions(
     connection.slackChannels.map((channel) => ({
@@ -920,6 +988,7 @@ function renderConnectionForm(connection) {
   );
 
   return `
+  <div class="card">
     <form class="inline-form" method="POST" action="/setup/refresh-options">
       <input type="hidden" name="connectionId" value="${escapeHtml(connection.id)}" />
       <button type="submit">Refresh Options</button>
@@ -980,6 +1049,7 @@ function renderConnectionForm(connection) {
       <input type="hidden" name="connectionId" value="${escapeHtml(connection.id)}" />
     </form>
     <button type="button" onclick="testConnection('${escapeHtml(connection.id)}')">Test Runtime Connection</button>
+  </div>
   `;
 }
 
@@ -1024,16 +1094,40 @@ function htmlPage(title, body) {
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>${escapeHtml(title)}</title>
   <style>
-    body { color: #1f2937; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; margin: 0; padding: 32px; }
-    main { max-width: 920px; margin: 0 auto; }
-    section, form { border: 1px solid #d1d5db; border-radius: 8px; margin: 20px 0; padding: 18px; }
+    body { background: #f8fafc; color: #1f2937; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; line-height: 1.5; margin: 0; padding: 32px; }
+    main { max-width: 1040px; margin: 0 auto; }
+    section, form { border: 0; margin: 0; padding: 0; }
+    h1 { margin: 0; }
+    h2 { margin-top: 0; }
     label { display: block; font-weight: 600; margin: 14px 0; }
     input, select { border: 1px solid #9ca3af; border-radius: 6px; box-sizing: border-box; display: block; font: inherit; margin-top: 6px; padding: 8px; width: 100%; }
     button, .button { background: #111827; border: 0; border-radius: 6px; color: white; display: inline-block; font: inherit; margin-right: 8px; padding: 9px 12px; text-decoration: none; }
+    button.secondary, .button.secondary { background: #e5e7eb; color: #111827; }
+    summary { cursor: pointer; font-weight: 700; }
     fieldset { border: 1px solid #d1d5db; border-radius: 6px; margin: 16px 0; }
     legend { font-weight: 700; }
     code, pre { background: #f3f4f6; border-radius: 6px; padding: 2px 4px; }
     pre { overflow: auto; padding: 12px; }
+    .page-header { align-items: center; display: flex; justify-content: space-between; gap: 16px; margin-bottom: 22px; }
+    .page-header p { color: #6b7280; margin: 4px 0 0; }
+    .tabs { display: flex; gap: 6px; margin-bottom: 18px; overflow-x: auto; }
+    .tab { background: #e5e7eb; color: #111827; }
+    .tab.is-active { background: #111827; color: white; }
+    .tab-panel { display: none; }
+    .tab-panel.is-active { display: block; }
+    .card, .status-card { background: white; border: 1px solid #d1d5db; border-radius: 8px; margin: 16px 0; padding: 18px; }
+    .grid, .status-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+    .workflow-map { align-items: stretch; display: grid; gap: 12px; grid-template-columns: 1fr auto 1fr auto 1fr; margin-bottom: 18px; }
+    .node { background: white; border: 1px solid #d1d5db; border-radius: 8px; padding: 16px; }
+    .node strong, .node span { display: block; }
+    .node span { color: #6b7280; margin-top: 4px; }
+    .arrow { align-self: center; color: #6b7280; font-size: 24px; }
+    .status-card strong, .status-card span { display: block; }
+    .status-card span:last-child { color: #6b7280; margin-top: 4px; }
+    .badge { border-radius: 999px; display: inline-block; font-size: 12px; font-weight: 700; margin-bottom: 8px; padding: 3px 8px; }
+    .badge.ok { background: #d1fae5; color: #065f46; }
+    .badge.missing { background: #fee2e2; color: #991b1b; }
+    .danger-zone { border-color: #fecaca; }
     .muted { color: #6b7280; }
     .success { color: #047857; font-weight: 700; }
     .error { color: #b91c1c; font-weight: 700; }
@@ -1052,6 +1146,13 @@ function htmlPage(title, body) {
     function closeModal(id) {
       document.getElementById(id)?.classList.remove("is-open");
     }
+    document.addEventListener("click", function(event) {
+      const tab = event.target.closest(".tab");
+      if (!tab) return;
+      const id = tab.getAttribute("data-tab");
+      document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("is-active", item === tab));
+      document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("is-active", panel.id === id));
+    });
     async function testConnection(connectionId) {
       const response = await fetch("/api/test-connection", {
         method: "POST",
