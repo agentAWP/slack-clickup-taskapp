@@ -72,7 +72,16 @@ const server = http.createServer(async (req, res) => {
       });
 
       if (!result.ok) {
+        if (wantsJson(req)) return sendJson(res, 400, result);
         return sendHtml(res, 400, renderOAuthResult("Connection settings", result));
+      }
+
+      if (wantsJson(req)) {
+        return sendJson(res, 200, {
+          ok: true,
+          message: "Connection settings saved.",
+          connection: result.connection
+        });
       }
 
       return redirect(res, "/setup?tab=connections&saved=1");
@@ -1012,7 +1021,7 @@ function renderConnectionForm(connection) {
       <input type="hidden" name="connectionId" value="${escapeHtml(connection.id)}" />
       <button type="submit">Refresh Options</button>
     </form>
-    <form method="POST" action="/setup/connections">
+    <form class="connection-settings-form" method="POST" action="/setup/connections">
       <input type="hidden" name="connectionId" value="${escapeHtml(connection.id)}" />
       <h3>${escapeHtml(connection.name)}</h3>
       <p class="muted">ID: <code>${escapeHtml(connection.id)}</code></p>
@@ -1067,7 +1076,10 @@ function renderConnectionForm(connection) {
           `).join("")}
         </fieldset>
       ` : ""}
-      <button type="submit">Save Connection</button>
+      <p class="form-actions">
+        <button type="submit">Save Connection</button>
+        <span class="save-status" role="status" aria-live="polite"></span>
+      </p>
     </form>
     ${renderOAuthModal({
       id: `clickup-${connection.id}`,
@@ -1165,6 +1177,10 @@ function htmlPage(title, body) {
     .success { color: #047857; font-weight: 700; }
     .error { color: #b91c1c; font-weight: 700; }
     .inline-form { border: 0; margin: 0; padding: 0; }
+    .form-actions { align-items: center; display: flex; gap: 10px; margin-bottom: 0; }
+    .save-status { color: #6b7280; font-weight: 700; }
+    .save-status.is-success { color: #047857; }
+    .save-status.is-error { color: #b91c1c; }
     .checkbox-label { align-items: center; display: flex; font-weight: 400; gap: 8px; margin: 8px 0; }
     .checkbox-label input { margin: 0; width: auto; }
     .modal-backdrop { align-items: center; background: rgba(17, 24, 39, 0.58); display: none; inset: 0; justify-content: center; padding: 20px; position: fixed; z-index: 10; }
@@ -1185,6 +1201,38 @@ function htmlPage(title, body) {
       const id = tab.getAttribute("data-tab");
       document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("is-active", item === tab));
       document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("is-active", panel.id === id));
+    });
+    document.addEventListener("submit", async function(event) {
+      const form = event.target.closest(".connection-settings-form");
+      if (!form) return;
+
+      event.preventDefault();
+      const status = form.querySelector(".save-status");
+      const button = form.querySelector("button[type='submit']");
+      status.textContent = "Saving...";
+      status.className = "save-status";
+      button.disabled = true;
+
+      try {
+        const response = await fetch(form.action, {
+          method: "POST",
+          headers: {
+            "Accept": "application/json",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "X-Requested-With": "fetch"
+          },
+          body: new URLSearchParams(new FormData(form))
+        });
+        const data = await response.json();
+        if (!response.ok || !data.ok) throw new Error(data.error || "Save failed.");
+        status.textContent = "✓ Saved";
+        status.className = "save-status is-success";
+      } catch (error) {
+        status.textContent = error.message || "Save failed.";
+        status.className = "save-status is-error";
+      } finally {
+        button.disabled = false;
+      }
     });
     async function testConnection(connectionId) {
       const response = await fetch("/api/test-connection", {
@@ -1425,6 +1473,11 @@ function sendJson(res, status, payload) {
 function sendHtml(res, status, html) {
   res.writeHead(status, { "Content-Type": "text/html; charset=utf-8" });
   res.end(html);
+}
+
+function wantsJson(req) {
+  return String(req.headers.accept || "").includes("application/json")
+    || req.headers["x-requested-with"] === "fetch";
 }
 
 function redirect(res, location) {
