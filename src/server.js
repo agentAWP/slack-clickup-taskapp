@@ -42,6 +42,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/oauth/slack/callback") {
       const result = await handleSlackOAuthCallback(url);
+      if (result.ok) return redirect(res, "/setup?tab=connections&connected=slack");
       return sendHtml(res, result.ok ? 200 : 400, renderOAuthResult("Slack", result));
     }
 
@@ -51,6 +52,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && url.pathname === "/oauth/clickup/callback") {
       const result = await handleClickUpOAuthCallback(url);
+      if (result.ok) return redirect(res, "/setup?tab=connections&connected=clickup");
       return sendHtml(res, result.ok ? 200 : 400, renderOAuthResult("ClickUp", result));
     }
 
@@ -73,7 +75,7 @@ const server = http.createServer(async (req, res) => {
         return sendHtml(res, 400, renderOAuthResult("Connection settings", result));
       }
 
-      return redirect(res, "/setup?saved=1");
+      return redirect(res, "/setup?tab=connections&saved=1");
     }
 
     if (req.method === "POST" && url.pathname === "/setup/refresh-options") {
@@ -85,12 +87,12 @@ const server = http.createServer(async (req, res) => {
         return sendHtml(res, 400, renderOAuthResult("Refresh options", result));
       }
 
-      return redirect(res, "/setup?refreshed=1");
+      return redirect(res, "/setup?tab=connections&refreshed=1");
     }
 
     if (req.method === "POST" && url.pathname === "/setup/reset") {
       saveConnectionStore({ connections: [] });
-      return redirect(res, "/setup?reset=1");
+      return redirect(res, "/setup?tab=demo-tools&reset=1");
     }
 
     if (req.method === "GET" && url.pathname === "/demo") {
@@ -837,6 +839,9 @@ function renderSetupPage(url) {
   const saved = url.searchParams.get("saved");
   const reset = url.searchParams.get("reset");
   const refreshed = url.searchParams.get("refreshed");
+  const activeTab = normalizeSetupTab(url.searchParams.get("tab"));
+  const connected = url.searchParams.get("connected");
+  const connectedLabel = connected === "slack" ? "Slack" : connected === "clickup" ? "ClickUp" : null;
 
   return htmlPage("TaskApp Setup", `
     <header class="page-header">
@@ -850,15 +855,16 @@ function renderSetupPage(url) {
     ${saved ? `<p class="success">Connection settings saved.</p>` : ""}
     ${reset ? `<p class="success">Runtime connections cleared.</p>` : ""}
     ${refreshed ? `<p class="success">Options refreshed from Slack and ClickUp.</p>` : ""}
+    ${connectedLabel ? `<p class="success">${connectedLabel} connected. Continue configuring this workflow connection below.</p>` : ""}
 
     <nav class="tabs" aria-label="Setup sections">
-      <button type="button" class="tab is-active" data-tab="workflow">Workflow</button>
-      <button type="button" class="tab" data-tab="connections">Connections</button>
-      <button type="button" class="tab" data-tab="test">Test</button>
-      <button type="button" class="tab" data-tab="demo-tools">Demo Tools</button>
+      <button type="button" class="${setupTabClass(activeTab, "workflow")}" data-tab="workflow">Workflow</button>
+      <button type="button" class="${setupTabClass(activeTab, "connections")}" data-tab="connections">Connections</button>
+      <button type="button" class="${setupTabClass(activeTab, "test")}" data-tab="test">Test</button>
+      <button type="button" class="${setupTabClass(activeTab, "demo-tools")}" data-tab="demo-tools">Demo Tools</button>
     </nav>
 
-    <section class="tab-panel is-active" id="workflow">
+    <section class="${setupPanelClass(activeTab, "workflow")}" id="workflow">
       <div class="workflow-map">
         <div class="node">
           <strong>Slack</strong>
@@ -891,12 +897,12 @@ function renderSetupPage(url) {
       </div>
     </section>
 
-    <section class="tab-panel" id="connections">
+    <section class="${setupPanelClass(activeTab, "connections")}" id="connections">
       <div class="status-grid">
         ${renderStatusCard("Slack OAuth App", process.env.SLACK_CLIENT_ID && process.env.SLACK_CLIENT_SECRET)}
         ${renderStatusCard("Slack Signing", process.env.SLACK_SIGNING_SECRET)}
         ${renderStatusCard("ClickUp OAuth App", process.env.CLICKUP_CLIENT_ID && process.env.CLICKUP_CLIENT_SECRET)}
-        ${renderStatusCard("Runtime Connections", connections.length, `${connections.length} configured`)}
+        ${renderStatusCard("Workflow Connections", connections.length, `${connections.length} saved workflow connection${connections.length === 1 ? "" : "s"}`)}
         ${renderStatusCard("Env Fallback", fallback)}
       </div>
       <div class="card">
@@ -914,7 +920,7 @@ function renderSetupPage(url) {
       ${connections.length ? connections.map(renderConnectionForm).join("") : `<div class="card"><p>No runtime connections yet. Install Slack and connect ClickUp to create one.</p></div>`}
     </section>
 
-    <section class="tab-panel" id="test">
+    <section class="${setupPanelClass(activeTab, "test")}" id="test">
       <div class="card">
         <h2>Test From Slack</h2>
         <p>Use this command in Slack after saving a runtime connection.</p>
@@ -926,7 +932,7 @@ function renderSetupPage(url) {
       </div>
     </section>
 
-    <section class="tab-panel" id="demo-tools">
+    <section class="${setupPanelClass(activeTab, "demo-tools")}" id="demo-tools">
       <div class="card">
         <h2>Fallback Backend Test</h2>
         <p>This bypasses the Slack command flow and uses env fallback credentials. It is only for troubleshooting or debrief backup.</p>
@@ -971,6 +977,19 @@ function renderStatusCard(label, value, detail) {
   `;
 }
 
+function normalizeSetupTab(tab) {
+  const tabs = new Set(["workflow", "connections", "test", "demo-tools"]);
+  return tabs.has(tab) ? tab : "workflow";
+}
+
+function setupTabClass(activeTab, tab) {
+  return `tab${activeTab === tab ? " is-active" : ""}`;
+}
+
+function setupPanelClass(activeTab, tab) {
+  return `tab-panel${activeTab === tab ? " is-active" : ""}`;
+}
+
 function renderConnectionForm(connection) {
   const channelOptions = renderSelectOptions(
     connection.slackChannels.map((channel) => ({
@@ -997,6 +1016,18 @@ function renderConnectionForm(connection) {
       <input type="hidden" name="connectionId" value="${escapeHtml(connection.id)}" />
       <h3>${escapeHtml(connection.name)}</h3>
       <p class="muted">ID: <code>${escapeHtml(connection.id)}</code></p>
+      <div class="status-grid connection-status-grid">
+        ${renderStatusCard(
+          "Slack Connection",
+          connection.slackBotToken && connection.slackTeamId,
+          connection.slackTeamName || connection.slackTeamId || "Install Slack"
+        )}
+        ${renderStatusCard(
+          "ClickUp Connection",
+          connection.clickupToken,
+          connection.clickupListId ? `Connected to List ${connection.clickupListId}` : "Connected; choose a ClickUp List"
+        )}
+      </div>
       <p>Slack team: ${escapeHtml(connection.slackTeamName || connection.slackTeamId || "Not connected")}</p>
       <p>Slack bot token: ${statusText(connection.slackBotToken)}</p>
       <p>ClickUp token: ${statusText(connection.clickupToken)}</p>
@@ -1082,7 +1113,7 @@ function renderOAuthResult(provider, result) {
     <h1>${escapeHtml(provider)} Setup</h1>
     <p class="${result.ok ? "success" : "error"}">${escapeHtml(result.message || result.error)}</p>
     ${result.connection ? `<pre>${escapeHtml(JSON.stringify(result.connection, null, 2))}</pre>` : ""}
-    <p><a href="/setup">Back to setup</a></p>
+    <p><a href="/setup?tab=connections">Back to connections</a></p>
   `);
 }
 
@@ -1117,6 +1148,8 @@ function htmlPage(title, body) {
     .tab-panel.is-active { display: block; }
     .card, .status-card { background: white; border: 1px solid #d1d5db; border-radius: 8px; margin: 16px 0; padding: 18px; }
     .grid, .status-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+    .connection-status-grid { margin: 12px 0 18px; }
+    .connection-status-grid .status-card { margin: 0; }
     .workflow-map { align-items: stretch; display: grid; gap: 12px; grid-template-columns: 1fr auto 1fr auto 1fr; margin-bottom: 18px; }
     .node { background: white; border: 1px solid #d1d5db; border-radius: 8px; padding: 16px; }
     .node strong, .node span { display: block; }
