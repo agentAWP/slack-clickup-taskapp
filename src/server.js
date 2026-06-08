@@ -57,12 +57,15 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/setup/connections") {
       const rawBody = await readBody(req);
       const form = new URLSearchParams(rawBody);
-      const selectedMemberAliases = normalizeList(form.getAll("selectedAssigneeAliases")).join(",");
+      const assigneeAliases = mergeAliasText(
+        form.get("assigneeAliases"),
+        form.getAll("selectedAssigneeAliases")
+      );
       const result = saveConnectionSettings({
         connectionId: form.get("connectionId"),
         name: form.get("name"),
         clickupListId: form.get("clickupListId"),
-        assigneeAliases: form.get("assigneeAliases") || selectedMemberAliases,
+        assigneeAliases,
         defaultSlackChannelId: form.get("defaultSlackChannelId")
       });
 
@@ -578,11 +581,16 @@ async function refreshConnectionOptions(connectionId) {
     else errors.push(lists.error);
 
     const listId = connection.clickupListId || lists.lists?.[0]?.id;
+    const workspaceMembers = await fetchClickUpWorkspaceMembers(connection);
+    let allMembers = workspaceMembers.ok ? workspaceMembers.members : [];
+    if (!workspaceMembers.ok) errors.push(workspaceMembers.error);
+
     if (listId) {
       const members = await fetchClickUpListMembers(connection, listId);
-      if (members.ok) updates.clickupMembers = members.members;
+      if (members.ok) allMembers = mergeMembers(allMembers, members.members);
       else errors.push(members.error);
     }
+    updates.clickupMembers = allMembers;
   }
 
   const updated = upsertConnection(updates);
@@ -678,6 +686,39 @@ async function fetchClickUpListMembers(connection, listId) {
     .sort((a, b) => a.username.localeCompare(b.username));
 
   return { ok: true, members };
+}
+
+async function fetchClickUpWorkspaceMembers(connection) {
+  const response = await clickUpGet(connection, "/team");
+  if (!response.ok) return response;
+
+  const members = [];
+  for (const team of response.data.teams || []) {
+    for (const entry of team.members || []) {
+      const member = entry.user || entry;
+      if (!member?.id) continue;
+      members.push({
+        id: member.id,
+        username: member.username || member.email || member.name || String(member.id),
+        email: member.email || null,
+        alias: makeAlias(member.username || member.email || member.name || String(member.id), member.id)
+      });
+    }
+  }
+
+  return {
+    ok: true,
+    members: mergeMembers([], members)
+  };
+}
+
+function mergeMembers(...memberGroups) {
+  const byId = new Map();
+  for (const member of memberGroups.flat()) {
+    if (!member?.id) continue;
+    byId.set(String(member.id), member);
+  }
+  return [...byId.values()].sort((a, b) => a.username.localeCompare(b.username));
 }
 
 async function clickUpGet(connection, apiPath) {
@@ -917,7 +958,7 @@ function renderConnectionForm(connection) {
       ${connection.clickupMembers.length ? `
         <fieldset>
           <legend>Suggested assignee aliases</legend>
-          <p class="muted">Select members to populate aliases if the text field above is empty.</p>
+          <p class="muted">Selected aliases are merged with anything typed in the text field above.</p>
           ${connection.clickupMembers.map((member) => `
             <label class="checkbox-label">
               <input type="checkbox" name="selectedAssigneeAliases" value="${escapeHtml(member.alias)}" />
@@ -1119,6 +1160,18 @@ function parseAssigneeAliases(aliasesText) {
     if (name && /^\d+$/.test(id)) aliases[name] = Number(id);
   }
   return aliases;
+}
+
+function mergeAliasText(...aliasGroups) {
+  const aliases = new Map();
+  for (const item of normalizeList(aliasGroups)) {
+    const [rawName, rawId] = item.split(":");
+    const name = rawName?.trim();
+    const id = rawId?.trim();
+    if (!name || !/^\d+$/.test(id)) continue;
+    aliases.set(name.toLowerCase(), `${name}:${id}`);
+  }
+  return [...aliases.values()].join(",");
 }
 
 function makeAlias(name, id) {
