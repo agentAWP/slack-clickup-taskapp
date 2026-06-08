@@ -27,6 +27,7 @@ Example Slack command:
 - Node.js 18 or newer.
 - A Slack app with:
   - Bot token with `chat:write`.
+  - Channel discovery scopes `channels:read` and `channels:join`.
   - Slash command named `/taskapp`.
   - Request URL pointing to this app's `/slack/commands/clickup-task` endpoint.
   - Signing secret for request verification.
@@ -116,8 +117,9 @@ Setup flow:
 1. Open `/setup`.
 2. Click **Install Slack**, confirm the modal, and authorize Slack.
 3. Click **Connect ClickUp**, confirm the modal, and authorize ClickUp.
-4. Save ClickUp List ID, default Slack channel, and assignee aliases.
-5. Use `/taskapp` in Slack.
+4. Click **Refresh Options** to discover Slack channels, ClickUp Lists, and ClickUp List members.
+5. Select a ClickUp List, select a default Slack channel, choose suggested member aliases or type your own aliases, then save.
+6. Use `/taskapp` in Slack.
 
 Assignee aliases use this format:
 
@@ -127,6 +129,7 @@ Thomas:32644579,Princess:32644580
 
 The setup page also includes:
 
+- **Refresh Options**: populates Slack channel dropdowns, ClickUp List dropdowns, and assignee alias suggestions.
 - **Run Demo**: uses the env fallback connection to create a known-good demo task.
 - **Test Runtime Connection**: creates a test task through the selected runtime connection.
 - **Clear Runtime Connections**: clears OAuth-created runtime connections without changing env fallback settings.

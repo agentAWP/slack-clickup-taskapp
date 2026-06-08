@@ -57,11 +57,12 @@ const server = http.createServer(async (req, res) => {
     if (req.method === "POST" && url.pathname === "/setup/connections") {
       const rawBody = await readBody(req);
       const form = new URLSearchParams(rawBody);
+      const selectedMemberAliases = normalizeList(form.getAll("selectedAssigneeAliases")).join(",");
       const result = saveConnectionSettings({
         connectionId: form.get("connectionId"),
         name: form.get("name"),
         clickupListId: form.get("clickupListId"),
-        assigneeAliases: form.get("assigneeAliases"),
+        assigneeAliases: form.get("assigneeAliases") || selectedMemberAliases,
         defaultSlackChannelId: form.get("defaultSlackChannelId")
       });
 
@@ -70,6 +71,18 @@ const server = http.createServer(async (req, res) => {
       }
 
       return redirect(res, "/setup?saved=1");
+    }
+
+    if (req.method === "POST" && url.pathname === "/setup/refresh-options") {
+      const rawBody = await readBody(req);
+      const form = new URLSearchParams(rawBody);
+      const result = await refreshConnectionOptions(form.get("connectionId"));
+
+      if (!result.ok) {
+        return sendHtml(res, 400, renderOAuthResult("Refresh options", result));
+      }
+
+      return redirect(res, "/setup?refreshed=1");
     }
 
     if (req.method === "POST" && url.pathname === "/setup/reset") {
@@ -447,7 +460,10 @@ function buildEnvConnection() {
     clickupToken: process.env.CLICKUP_TOKEN,
     clickupListId: process.env.CLICKUP_LIST_ID,
     assigneeAliases: process.env.CLICKUP_ASSIGNEE_ALIASES || "",
-    defaultSlackChannelId: process.env.SLACK_DEFAULT_CHANNEL_ID || null
+    defaultSlackChannelId: process.env.SLACK_DEFAULT_CHANNEL_ID || null,
+    slackChannels: [],
+    clickupLists: [],
+    clickupMembers: []
   };
 }
 
@@ -503,6 +519,9 @@ function normalizeStoredConnection(connection) {
     clickupListId: connection.clickupListId || null,
     assigneeAliases: connection.assigneeAliases || "",
     defaultSlackChannelId: connection.defaultSlackChannelId || null,
+    slackChannels: Array.isArray(connection.slackChannels) ? connection.slackChannels : [],
+    clickupLists: Array.isArray(connection.clickupLists) ? connection.clickupLists : [],
+    clickupMembers: Array.isArray(connection.clickupMembers) ? connection.clickupMembers : [],
     createdAt: connection.createdAt || null,
     updatedAt: connection.updatedAt || null
   };
@@ -539,12 +558,145 @@ function saveConnectionSettings({ connectionId, name, clickupListId, assigneeAli
   return { ok: true, connection: sanitizeConnection(updated) };
 }
 
+async function refreshConnectionOptions(connectionId) {
+  if (!connectionId) return { ok: false, error: "Missing connectionId." };
+  const connection = findConnectionForRequest({ connectionId, allowDefault: false });
+  if (!connection || connection.source === "env") return { ok: false, error: "Runtime connection not found." };
+
+  const updates = { id: connection.id };
+  const errors = [];
+
+  if (connection.slackBotToken) {
+    const channels = await fetchSlackChannels(connection);
+    if (channels.ok) updates.slackChannels = channels.channels;
+    else errors.push(channels.error);
+  }
+
+  if (connection.clickupToken) {
+    const lists = await fetchClickUpLists(connection);
+    if (lists.ok) updates.clickupLists = lists.lists;
+    else errors.push(lists.error);
+
+    const listId = connection.clickupListId || lists.lists?.[0]?.id;
+    if (listId) {
+      const members = await fetchClickUpListMembers(connection, listId);
+      if (members.ok) updates.clickupMembers = members.members;
+      else errors.push(members.error);
+    }
+  }
+
+  const updated = upsertConnection(updates);
+  return {
+    ok: errors.length === 0,
+    message: errors.length ? errors.join(" ") : "Options refreshed.",
+    error: errors.join(" "),
+    connection: sanitizeConnection(updated)
+  };
+}
+
+async function fetchSlackChannels(connection) {
+  const response = await fetch(`${SLACK_API_BASE}/conversations.list?types=public_channel&exclude_archived=true&limit=200`, {
+    headers: { Authorization: `Bearer ${connection.slackBotToken}` }
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.ok) {
+    return { ok: false, error: `Slack channel discovery failed: ${data.error || response.statusText}` };
+  }
+
+  return {
+    ok: true,
+    channels: (data.channels || [])
+      .filter((channel) => channel.id && channel.name)
+      .map((channel) => ({
+        id: channel.id,
+        name: channel.name,
+        isMember: Boolean(channel.is_member)
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+  };
+}
+
+async function fetchClickUpLists(connection) {
+  const teamsResponse = await clickUpGet(connection, "/team");
+  if (!teamsResponse.ok) return teamsResponse;
+
+  const lists = [];
+  for (const team of teamsResponse.data.teams || []) {
+    const spaces = await clickUpGet(connection, `/team/${team.id}/space`);
+    if (!spaces.ok) return spaces;
+
+    for (const space of spaces.data.spaces || []) {
+      const folderless = await clickUpGet(connection, `/space/${space.id}/list`);
+      if (folderless.ok) {
+        for (const list of folderless.data.lists || []) {
+          lists.push({
+            id: list.id,
+            name: list.name,
+            path: `${team.name} / ${space.name} / ${list.name}`
+          });
+        }
+      }
+
+      const folders = await clickUpGet(connection, `/space/${space.id}/folder`);
+      if (!folders.ok) return folders;
+
+      for (const folder of folders.data.folders || []) {
+        const folderLists = await clickUpGet(connection, `/folder/${folder.id}/list`);
+        if (!folderLists.ok) return folderLists;
+
+        for (const list of folderLists.data.lists || []) {
+          lists.push({
+            id: list.id,
+            name: list.name,
+            path: `${team.name} / ${space.name} / ${folder.name} / ${list.name}`
+          });
+        }
+      }
+    }
+  }
+
+  return {
+    ok: true,
+    lists: lists.sort((a, b) => a.path.localeCompare(b.path))
+  };
+}
+
+async function fetchClickUpListMembers(connection, listId) {
+  const response = await clickUpGet(connection, `/list/${listId}/member`);
+  if (!response.ok) return response;
+
+  const rawMembers = response.data.members || response.data.users || [];
+  const members = rawMembers
+    .map((entry) => entry.user || entry)
+    .filter((member) => member?.id)
+    .map((member) => ({
+      id: member.id,
+      username: member.username || member.email || member.name || String(member.id),
+      email: member.email || null,
+      alias: makeAlias(member.username || member.email || member.name || String(member.id), member.id)
+    }))
+    .sort((a, b) => a.username.localeCompare(b.username));
+
+  return { ok: true, members };
+}
+
+async function clickUpGet(connection, apiPath) {
+  const response = await fetch(`${CLICKUP_API_BASE}${apiPath}`, {
+    headers: { Authorization: connection.clickupToken }
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    return { ok: false, error: `ClickUp discovery failed for ${apiPath}: ${data.err || data.error || response.statusText}` };
+  }
+  return { ok: true, data };
+}
+
 function buildSlackInstallUrl() {
   const clientId = process.env.SLACK_CLIENT_ID;
   if (!clientId) return "/setup?error=missing_slack_client_id";
   const authorizeUrl = new URL("https://slack.com/oauth/v2/authorize");
   authorizeUrl.searchParams.set("client_id", clientId);
-  authorizeUrl.searchParams.set("scope", "commands,chat:write");
+  authorizeUrl.searchParams.set("scope", "commands,chat:write,channels:read,channels:join");
   authorizeUrl.searchParams.set("redirect_uri", `${APP_BASE_URL}/oauth/slack/callback`);
   return authorizeUrl.toString();
 }
@@ -711,7 +863,26 @@ function renderSetupPage(url) {
 }
 
 function renderConnectionForm(connection) {
+  const channelOptions = renderSelectOptions(
+    connection.slackChannels.map((channel) => ({
+      value: channel.id,
+      label: `#${channel.name}${channel.isMember ? "" : " (not joined)"}`
+    })),
+    connection.defaultSlackChannelId
+  );
+  const listOptions = renderSelectOptions(
+    connection.clickupLists.map((list) => ({
+      value: list.id,
+      label: list.path
+    })),
+    connection.clickupListId
+  );
+
   return `
+    <form class="inline-form" method="POST" action="/setup/refresh-options">
+      <input type="hidden" name="connectionId" value="${escapeHtml(connection.id)}" />
+      <button type="submit">Refresh Options</button>
+    </form>
     <form method="POST" action="/setup/connections">
       <input type="hidden" name="connectionId" value="${escapeHtml(connection.id)}" />
       <h3>${escapeHtml(connection.name)}</h3>
@@ -719,6 +890,9 @@ function renderConnectionForm(connection) {
       <p>Slack team: ${escapeHtml(connection.slackTeamName || connection.slackTeamId || "Not connected")}</p>
       <p>Slack bot token: ${statusText(connection.slackBotToken)}</p>
       <p>ClickUp token: ${statusText(connection.clickupToken)}</p>
+      <p class="muted">Discovered Slack channels: ${connection.slackChannels.length}</p>
+      <p class="muted">Discovered ClickUp lists: ${connection.clickupLists.length}</p>
+      <p class="muted">Discovered ClickUp members: ${connection.clickupMembers.length}</p>
       <p><button type="button" onclick="openModal('clickup-${escapeHtml(connection.id)}')">Connect ClickUp for this connection</button></p>
       <label>
         Display name
@@ -726,16 +900,32 @@ function renderConnectionForm(connection) {
       </label>
       <label>
         ClickUp List ID
-        <input name="clickupListId" value="${escapeHtml(connection.clickupListId || "")}" placeholder="901714346157" />
+        ${connection.clickupLists.length
+          ? `<select name="clickupListId">${listOptions}</select>`
+          : `<input name="clickupListId" value="${escapeHtml(connection.clickupListId || "")}" placeholder="901714346157" />`}
       </label>
       <label>
         Default Slack Channel ID
-        <input name="defaultSlackChannelId" value="${escapeHtml(connection.defaultSlackChannelId || "")}" placeholder="C1234567890" />
+        ${connection.slackChannels.length
+          ? `<select name="defaultSlackChannelId">${channelOptions}</select>`
+          : `<input name="defaultSlackChannelId" value="${escapeHtml(connection.defaultSlackChannelId || "")}" placeholder="C1234567890" />`}
       </label>
       <label>
         Assignee aliases
         <input name="assigneeAliases" value="${escapeHtml(connection.assigneeAliases || "")}" placeholder="Thomas:32644579,Princess:32644580" />
       </label>
+      ${connection.clickupMembers.length ? `
+        <fieldset>
+          <legend>Suggested assignee aliases</legend>
+          <p class="muted">Select members to populate aliases if the text field above is empty.</p>
+          ${connection.clickupMembers.map((member) => `
+            <label class="checkbox-label">
+              <input type="checkbox" name="selectedAssigneeAliases" value="${escapeHtml(member.alias)}" />
+              ${escapeHtml(member.username)} -> <code>${escapeHtml(member.alias)}</code>
+            </label>
+          `).join("")}
+        </fieldset>
+      ` : ""}
       <button type="submit">Save Connection</button>
     </form>
     ${renderOAuthModal({
@@ -750,6 +940,15 @@ function renderConnectionForm(connection) {
     </form>
     <button type="button" onclick="testConnection('${escapeHtml(connection.id)}')">Test Runtime Connection</button>
   `;
+}
+
+function renderSelectOptions(options, selectedValue) {
+  const selected = String(selectedValue || "");
+  const empty = `<option value="">Choose an option</option>`;
+  return empty + options.map((option) => {
+    const value = String(option.value);
+    return `<option value="${escapeHtml(value)}"${value === selected ? " selected" : ""}>${escapeHtml(option.label)}</option>`;
+  }).join("");
 }
 
 function renderOAuthModal({ id, title, body, href, cta }) {
@@ -788,14 +987,18 @@ function htmlPage(title, body) {
     main { max-width: 920px; margin: 0 auto; }
     section, form { border: 1px solid #d1d5db; border-radius: 8px; margin: 20px 0; padding: 18px; }
     label { display: block; font-weight: 600; margin: 14px 0; }
-    input { border: 1px solid #9ca3af; border-radius: 6px; box-sizing: border-box; display: block; font: inherit; margin-top: 6px; padding: 8px; width: 100%; }
+    input, select { border: 1px solid #9ca3af; border-radius: 6px; box-sizing: border-box; display: block; font: inherit; margin-top: 6px; padding: 8px; width: 100%; }
     button, .button { background: #111827; border: 0; border-radius: 6px; color: white; display: inline-block; font: inherit; margin-right: 8px; padding: 9px 12px; text-decoration: none; }
+    fieldset { border: 1px solid #d1d5db; border-radius: 6px; margin: 16px 0; }
+    legend { font-weight: 700; }
     code, pre { background: #f3f4f6; border-radius: 6px; padding: 2px 4px; }
     pre { overflow: auto; padding: 12px; }
     .muted { color: #6b7280; }
     .success { color: #047857; font-weight: 700; }
     .error { color: #b91c1c; font-weight: 700; }
     .inline-form { border: 0; margin: 0; padding: 0; }
+    .checkbox-label { align-items: center; display: flex; font-weight: 400; gap: 8px; margin: 8px 0; }
+    .checkbox-label input { margin: 0; width: auto; }
     .modal-backdrop { align-items: center; background: rgba(17, 24, 39, 0.58); display: none; inset: 0; justify-content: center; padding: 20px; position: fixed; z-index: 10; }
     .modal-backdrop.is-open { display: flex; }
     .modal { background: white; border-radius: 8px; box-shadow: 0 24px 72px rgba(0, 0, 0, 0.25); max-width: 520px; padding: 22px; width: 100%; }
@@ -916,6 +1119,16 @@ function parseAssigneeAliases(aliasesText) {
     if (name && /^\d+$/.test(id)) aliases[name] = Number(id);
   }
   return aliases;
+}
+
+function makeAlias(name, id) {
+  const alias = String(name || id)
+    .split("@")[0]
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  return `${alias || id}:${id}`;
 }
 
 function normalizeTags(input) {
