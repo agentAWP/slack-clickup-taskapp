@@ -2,6 +2,12 @@
 
 Lightweight FDE take-home app that connects Slack and ClickUp. A Slack slash command triggers this app, the app creates a ClickUp task, and Slack receives one clean confirmation with the task URL.
 
+Live deployment:
+
+- App and setup: https://slack-clickup-taskapp.onrender.com/setup
+- Health: https://slack-clickup-taskapp.onrender.com/health
+- Demo metadata: https://slack-clickup-taskapp.onrender.com/demo
+
 ## What it does
 
 - Accepts the Slack slash command `/taskapp` at `POST /slack/commands/clickup-task`.
@@ -268,15 +274,15 @@ https://YOUR_RENDER_APP.onrender.com/slack/commands/clickup-task
 Public inspection endpoints:
 
 ```text
-https://YOUR_RENDER_APP.onrender.com/setup
-https://YOUR_RENDER_APP.onrender.com/health
-https://YOUR_RENDER_APP.onrender.com/demo
+https://slack-clickup-taskapp.onrender.com/setup
+https://slack-clickup-taskapp.onrender.com/health
+https://slack-clickup-taskapp.onrender.com/demo
 ```
 
 Fallback demo endpoint:
 
 ```bash
-curl --request POST https://YOUR_RENDER_APP.onrender.com/api/run-demo
+curl --request POST https://slack-clickup-taskapp.onrender.com/api/run-demo
 ```
 
 Runtime connection test endpoint:
@@ -288,9 +294,18 @@ curl --request POST \
   --data '{"connectionId":"runtime-connection-id","tags":["runtime","test"]}'
 ```
 
-If using Render's free tier, open `/health` shortly before the live demo to wake the service.
+This project uses Render's free tier. Open `/health` shortly before the live demo because a sleeping instance may take about a minute to wake.
 
-For persistent runtime connections on Render, attach a persistent disk and point `DATA_FILE` at that disk path. Without a persistent disk, `data/connections.json` may be lost on redeploy/restart.
+### Runtime storage decision
+
+Runtime OAuth connections are stored in `data/connections.json`. Render's free tier does not provide a persistent disk, so this file is intentionally treated as ephemeral and may be cleared by a restart or deployment.
+
+For this take-home:
+
+- The in-product OAuth flow demonstrates that Slack and ClickUp connections can be created dynamically without changing code or redeploying.
+- Environment-backed Slack and ClickUp credentials provide a reliable fallback for the interview demo.
+- Reconnecting through `/setup` restores a runtime connection if Render clears the file.
+- A production deployment would store encrypted OAuth tokens and connection metadata in a database or managed secret store.
 
 ## Demo script
 
@@ -300,10 +315,10 @@ Short explanation:
 This app connects Slack and ClickUp. Slack sends a signed slash-command webhook to my Node server. The server verifies the request, resolves the connected Slack team to a runtime ClickUp connection, parses the task details, creates a task in ClickUp, and returns one ephemeral Slack confirmation with the task URL. I also included a setup page, direct API endpoint, health endpoint, and demo endpoint for live inspection.
 ```
 
-Fallback line if OAuth setup is unavailable during the debrief:
+Fallback line if the ephemeral runtime connection is unavailable during the debrief:
 
 ```text
-I also kept a Run Demo fallback that uses an env-configured connection, so the core Slack/ClickUp workflow can still be demonstrated reliably while the live OAuth setup remains visible in-product.
+I also kept an env-configured backend fallback, so the core Slack/ClickUp workflow can still be demonstrated reliably while the live OAuth setup remains visible in-product.
 ```
 
 Live demo command:
@@ -336,6 +351,7 @@ The app gracefully handles:
 ## Assumptions
 
 - This demo uses a lightweight JSON file instead of a database.
+- Render free-tier runtime connection storage is ephemeral by design; env-backed credentials are the demo fallback.
 - The Slack command name is `/taskapp`.
 - Runtime setup is intentionally simple server-rendered HTML.
 - A production multi-tenant version would add auth around `/setup`, encrypted token storage, and a database-backed connection table.

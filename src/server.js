@@ -874,34 +874,57 @@ function renderSetupPage(url) {
     </nav>
 
     <section class="${setupPanelClass(activeTab, "workflow")}" id="workflow">
-      <div class="workflow-map">
-        <div class="node">
-          <strong>Slack</strong>
-          <span>/taskapp command</span>
+      <div class="workflow-heading">
+        <div>
+          <p class="eyebrow">Live integration workflow</p>
+          <h2>From Slack command to ClickUp task</h2>
         </div>
-        <div class="arrow">→</div>
-        <div class="node">
-          <strong>TaskApp</strong>
-          <span>parse + map fields</span>
+        <span class="workflow-badge">Signed + OAuth connected</span>
+      </div>
+      <div class="workflow-diagram" aria-label="Slack to ClickUp workflow">
+        <div class="workflow-step">
+          <span class="step-number">1</span>
+          <span class="step-app slack-app">Slack</span>
+          <strong>User runs /taskapp</strong>
+          <span>Task name, assignee, tags, priority, due date, and description.</span>
         </div>
-        <div class="arrow">→</div>
-        <div class="node">
-          <strong>ClickUp</strong>
-          <span>create task</span>
+        <div class="workflow-connector"><span>Signed webhook</span></div>
+        <div class="workflow-step">
+          <span class="step-number">2</span>
+          <span class="step-app taskapp-app">TaskApp</span>
+          <strong>Verify + resolve</strong>
+          <span>Verify Slack signature and find the saved connection using the Slack team ID.</span>
+        </div>
+        <div class="workflow-connector"><span>Mapped task data</span></div>
+        <div class="workflow-step">
+          <span class="step-number">3</span>
+          <span class="step-app clickup-app">ClickUp</span>
+          <strong>Create the task</strong>
+          <span>Use the connected ClickUp token, selected List, aliases, and tags.</span>
+        </div>
+        <div class="workflow-connector"><span>Task result</span></div>
+        <div class="workflow-step">
+          <span class="step-number">4</span>
+          <span class="step-app slack-app">Slack</span>
+          <strong>Confirm to the user</strong>
+          <span>Return one ephemeral response with the task URL and action summary.</span>
         </div>
       </div>
-      <div class="grid">
-        <div class="card">
-          <h2>Trigger</h2>
-          <p>Slack sends a signed slash-command webhook to this app.</p>
+      <div class="workflow-details">
+        <div>
+          <span class="detail-label">Input</span>
+          <strong>Slack context</strong>
+          <p><code>team_id</code>, <code>channel_id</code>, user, and command text</p>
         </div>
-        <div class="card">
-          <h2>Mapped Fields</h2>
-          <p>Name, assignee, tags, priority, due date, and description.</p>
+        <div>
+          <span class="detail-label">Runtime mapping</span>
+          <strong>Connection configuration</strong>
+          <p>ClickUp List, default Slack channel, assignee aliases, and OAuth tokens</p>
         </div>
-        <div class="card">
-          <h2>Action</h2>
-          <p>Create a ClickUp task in the selected List and return a Slack confirmation.</p>
+        <div>
+          <span class="detail-label">Output</span>
+          <strong>Action context</strong>
+          <p>ClickUp task ID, URL, status, assignees, tags, and Slack confirmation</p>
         </div>
       </div>
     </section>
@@ -1162,11 +1185,29 @@ function htmlPage(title, body) {
     .grid, .status-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
     .connection-status-grid { margin: 12px 0 18px; }
     .connection-status-grid .status-card { margin: 0; }
-    .workflow-map { align-items: stretch; display: grid; gap: 12px; grid-template-columns: 1fr auto 1fr auto 1fr; margin-bottom: 18px; }
-    .node { background: white; border: 1px solid #d1d5db; border-radius: 8px; padding: 16px; }
-    .node strong, .node span { display: block; }
-    .node span { color: #6b7280; margin-top: 4px; }
-    .arrow { align-self: center; color: #6b7280; font-size: 24px; }
+    .workflow-heading { align-items: end; display: flex; gap: 16px; justify-content: space-between; margin: 6px 0 22px; }
+    .workflow-heading h2 { font-size: 26px; margin: 2px 0 0; }
+    .eyebrow, .detail-label { color: #475569; font-size: 12px; font-weight: 800; letter-spacing: 0; margin: 0; text-transform: uppercase; }
+    .workflow-badge { background: #dcfce7; border: 1px solid #86efac; border-radius: 999px; color: #166534; font-size: 13px; font-weight: 700; padding: 6px 10px; white-space: nowrap; }
+    .workflow-diagram { align-items: stretch; display: grid; grid-template-columns: minmax(0, 1fr) 72px minmax(0, 1fr) 72px minmax(0, 1fr) 72px minmax(0, 1fr); }
+    .workflow-step { background: white; border: 1px solid #cbd5e1; border-radius: 8px; min-height: 190px; padding: 18px; position: relative; }
+    .workflow-step strong, .workflow-step > span:last-child { display: block; }
+    .workflow-step strong { font-size: 16px; margin: 18px 0 7px; }
+    .workflow-step > span:last-child { color: #64748b; font-size: 14px; }
+    .step-number { align-items: center; background: #0f172a; border-radius: 50%; color: white; display: flex; font-size: 12px; font-weight: 800; height: 26px; justify-content: center; position: absolute; right: 14px; top: 14px; width: 26px; }
+    .step-app { border-radius: 5px; display: inline-block; font-size: 12px; font-weight: 800; padding: 5px 8px; }
+    .slack-app { background: #f3e8ff; color: #6b21a8; }
+    .taskapp-app { background: #dbeafe; color: #1e40af; }
+    .clickup-app { background: #ffedd5; color: #9a3412; }
+    .workflow-connector { align-items: center; display: flex; justify-content: center; position: relative; }
+    .workflow-connector::before { background: #94a3b8; content: ""; height: 2px; left: 8px; position: absolute; right: 8px; top: 50%; }
+    .workflow-connector::after { border-bottom: 5px solid transparent; border-left: 7px solid #64748b; border-top: 5px solid transparent; content: ""; position: absolute; right: 5px; top: calc(50% - 4px); }
+    .workflow-connector span { background: #f8fafc; color: #64748b; font-size: 10px; font-weight: 700; padding: 3px; position: relative; text-align: center; z-index: 1; }
+    .workflow-details { border-bottom: 1px solid #cbd5e1; border-top: 1px solid #cbd5e1; display: grid; gap: 0; grid-template-columns: repeat(3, 1fr); margin-top: 24px; }
+    .workflow-details > div { padding: 18px; }
+    .workflow-details > div + div { border-left: 1px solid #cbd5e1; }
+    .workflow-details strong { display: block; margin-top: 5px; }
+    .workflow-details p { color: #64748b; font-size: 14px; margin: 5px 0 0; }
     .status-card strong, .status-card span { display: block; }
     .status-card span:last-child { color: #6b7280; margin-top: 4px; }
     .badge { border-radius: 999px; display: inline-block; font-size: 12px; font-weight: 700; margin-bottom: 8px; padding: 3px 8px; }
@@ -1187,6 +1228,21 @@ function htmlPage(title, body) {
     .modal-backdrop.is-open { display: flex; }
     .modal { background: white; border-radius: 8px; box-shadow: 0 24px 72px rgba(0, 0, 0, 0.25); max-width: 520px; padding: 22px; width: 100%; }
     .modal-actions { display: flex; gap: 8px; margin-bottom: 0; }
+    @media (max-width: 900px) {
+      .workflow-diagram { grid-template-columns: 1fr; }
+      .workflow-step { min-height: 0; }
+      .workflow-connector { height: 54px; }
+      .workflow-connector::before { bottom: 8px; height: auto; left: 50%; right: auto; top: 8px; width: 2px; }
+      .workflow-connector::after { border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 7px solid #64748b; bottom: 4px; left: calc(50% - 4px); right: auto; top: auto; }
+      .workflow-connector span { max-width: 120px; }
+    }
+    @media (max-width: 640px) {
+      body { padding: 20px; }
+      .page-header, .workflow-heading { align-items: flex-start; flex-direction: column; }
+      .workflow-badge { white-space: normal; }
+      .workflow-details { grid-template-columns: 1fr; }
+      .workflow-details > div + div { border-left: 0; border-top: 1px solid #cbd5e1; }
+    }
   </style>
   <script>
     function openModal(id) {
