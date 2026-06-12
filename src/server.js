@@ -1525,6 +1525,7 @@ function htmlPage(title, body) {
     label { display: block; font-weight: 600; margin: 14px 0; }
     input, select { border: 1px solid #9ca3af; border-radius: 6px; box-sizing: border-box; display: block; font: inherit; margin-top: 6px; padding: 8px; width: 100%; }
     button, .button { background: #111827; border: 0; border-radius: 6px; color: white; display: inline-block; font: inherit; margin-right: 8px; padding: 9px 12px; text-decoration: none; }
+    [hidden] { display: none !important; }
     button.secondary, .button.secondary { background: #e5e7eb; color: #111827; }
     summary { cursor: pointer; font-weight: 700; }
     fieldset { border: 1px solid #d1d5db; border-radius: 6px; margin: 16px 0; }
