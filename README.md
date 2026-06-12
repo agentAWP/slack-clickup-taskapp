@@ -153,7 +153,7 @@ The Render free tier has an ephemeral filesystem. Runtime OAuth connections can 
 
 **Complete for the take-home scope.** The Connections page installs Slack and connects ClickUp through OAuth, discovers available configuration options, and saves runtime connection settings without a deployment. The app intentionally has no user, tenant, or organization model.
 
-## Requirements
+## Prerequisites
 
 - Node.js 18 or newer.
 - A Slack app with:
