@@ -1183,8 +1183,6 @@ function renderSetupPage(url) {
   const store = loadConnectionStore();
   const connections = store.connections.map(normalizeStoredConnection);
   const fallback = buildEnvConnection();
-  const taskConnections = [...connections];
-  if (fallback) taskConnections.push(fallback);
   const error = url.searchParams.get("error");
   const saved = url.searchParams.get("saved");
   const reset = url.searchParams.get("reset");
@@ -1210,9 +1208,7 @@ function renderSetupPage(url) {
     <nav class="tabs" aria-label="Setup sections">
       <button type="button" class="${setupTabClass(activeTab, "workflow")}" data-tab="workflow">Workflow</button>
       <button type="button" class="${setupTabClass(activeTab, "connections")}" data-tab="connections">Connections</button>
-      <button type="button" class="${setupTabClass(activeTab, "tasks")}" data-tab="tasks">Tasks</button>
       <button type="button" class="${setupTabClass(activeTab, "test")}" data-tab="test">Test</button>
-      <button type="button" class="${setupTabClass(activeTab, "demo-tools")}" data-tab="demo-tools">Demo Tools</button>
     </nav>
 
     <section class="${setupPanelClass(activeTab, "workflow")}" id="workflow">
@@ -1295,31 +1291,6 @@ function renderSetupPage(url) {
       ${connections.length ? connections.map(renderConnectionForm).join("") : `<div class="card"><p>No runtime connections yet. Install Slack and connect ClickUp to create one.</p></div>`}
     </section>
 
-    <section class="${setupPanelClass(activeTab, "tasks")}" id="tasks">
-      <div class="task-toolbar">
-        <div>
-          <p class="eyebrow">ClickUp task management</p>
-          <h2>Active Tasks</h2>
-          <p class="muted">View and manage non-closed, non-archived tasks in the selected ClickUp List.</p>
-        </div>
-        <div class="task-toolbar-controls">
-          <label>
-            Connection
-            <select id="task-connection">${renderTaskConnectionOptions(taskConnections)}</select>
-          </label>
-          <label>
-            Admin key
-            <input id="task-admin-key" type="password" autocomplete="off" placeholder="TASKAPP_ADMIN_KEY" />
-          </label>
-          <button type="button" id="load-tasks-button" onclick="unlockTaskManager()">Load Tasks</button>
-        </div>
-      </div>
-      ${taskConnections.length ? "" : `<div class="card"><p>No ClickUp connection is available. Connect ClickUp or configure the env fallback first.</p></div>`}
-      <p id="task-feedback" class="task-feedback" role="status" aria-live="polite"></p>
-      <div id="task-list" class="task-list" aria-live="polite"></div>
-      <button type="button" id="load-more-tasks" class="secondary" hidden onclick="loadMoreTasks()">Load More</button>
-    </section>
-
     <section class="${setupPanelClass(activeTab, "test")}" id="test">
       <div class="card">
         <h2>Test From Slack</h2>
@@ -1329,23 +1300,6 @@ function renderSetupPage(url) {
       <div class="card">
         <h2>Test Runtime Connection</h2>
         <p>Use the button on a connection card to create a test task with that saved runtime connection.</p>
-      </div>
-    </section>
-
-    <section class="${setupPanelClass(activeTab, "demo-tools")}" id="demo-tools">
-      <div class="card">
-        <h2>Fallback Backend Test</h2>
-        <p>This bypasses the Slack command flow and uses env fallback credentials. It is only for troubleshooting or debrief backup.</p>
-        <form class="inline-form" method="POST" action="/api/run-demo" onsubmit="return confirm('This will create a real ClickUp task and post to Slack without going through /taskapp. Continue?');">
-          <button type="submit">Run Backend Fallback Test</button>
-        </form>
-      </div>
-      <div class="card danger-zone">
-        <h2>Reset Runtime Connections</h2>
-        <p>This clears only OAuth-created runtime connections. It does not affect env fallback settings.</p>
-        <form class="inline-form" method="POST" action="/setup/reset" onsubmit="return confirm('Clear runtime connections? Env fallback will remain unchanged.');">
-          <button type="submit">Clear Runtime Connections</button>
-        </form>
       </div>
     </section>
 
@@ -1363,42 +1317,6 @@ function renderSetupPage(url) {
       href: "/setup/clickup/connect",
       cta: "Continue to ClickUp"
     })}
-    <div class="modal-backdrop" id="task-edit-modal" role="dialog" aria-modal="true" aria-labelledby="task-edit-title">
-      <div class="modal">
-        <h2 id="task-edit-title">Edit ClickUp Task</h2>
-        <form id="task-edit-form" onsubmit="saveTaskEdits(event)">
-          <input type="hidden" id="edit-task-id" />
-          <label>
-            Title
-            <input id="edit-task-name" required />
-          </label>
-          <label>
-            Due date
-            <input id="edit-task-due" type="date" />
-          </label>
-          <fieldset>
-            <legend>Assignees</legend>
-            <div id="edit-task-assignees"></div>
-          </fieldset>
-          <p class="modal-actions">
-            <button type="submit">Save Changes</button>
-            <button type="button" class="secondary" onclick="closeModal('task-edit-modal')">Cancel</button>
-          </p>
-        </form>
-      </div>
-    </div>
-    <div class="modal-backdrop" id="task-delete-modal" role="dialog" aria-modal="true" aria-labelledby="task-delete-title">
-      <div class="modal">
-        <h2 id="task-delete-title">Delete ClickUp Task</h2>
-        <p>Delete <strong id="delete-task-name"></strong> permanently?</p>
-        <p class="error">This action cannot be undone.</p>
-        <input type="hidden" id="delete-task-id" />
-        <p class="modal-actions">
-          <button type="button" class="danger-button" onclick="confirmTaskDelete()">Delete Task</button>
-          <button type="button" class="secondary" onclick="closeModal('task-delete-modal')">Cancel</button>
-        </p>
-      </div>
-    </div>
   `);
 }
 
@@ -1414,17 +1332,8 @@ function renderStatusCard(label, value, detail) {
 }
 
 function normalizeSetupTab(tab) {
-  const tabs = new Set(["workflow", "connections", "tasks", "test", "demo-tools"]);
+  const tabs = new Set(["workflow", "connections", "test"]);
   return tabs.has(tab) ? tab : "workflow";
-}
-
-function renderTaskConnectionOptions(connections) {
-  if (!connections.length) return `<option value="">No ClickUp connections</option>`;
-  return connections.map((connection) => {
-    const ready = Boolean(connection.clickupToken && connection.clickupListId);
-    const label = `${connection.name}${ready ? "" : " (needs ClickUp List)"}`;
-    return `<option value="${escapeHtml(connection.id)}"${ready ? "" : " disabled"}>${escapeHtml(label)}</option>`;
-  }).join("");
 }
 
 function setupTabClass(activeTab, tab) {
