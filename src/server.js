@@ -9,7 +9,7 @@ loadDotEnv();
 const PORT = Number(process.env.PORT || 3000);
 const APP_BASE_URL = process.env.APP_BASE_URL || `http://localhost:${PORT}`;
 const DATA_FILE = process.env.DATA_FILE || path.join(process.cwd(), "data", "connections.json");
-const CLICKUP_API_BASE = "https://api.clickup.com/api/v2";
+const CLICKUP_API_BASE = process.env.CLICKUP_API_BASE || "https://api.clickup.com/api/v2";
 const SLACK_API_BASE = "https://slack.com/api";
 
 const server = http.createServer(async (req, res) => {
@@ -27,6 +27,9 @@ const server = http.createServer(async (req, res) => {
           "POST /api/run-demo",
           "POST /api/test-connection",
           "POST /api/create-clickup-task",
+          "GET /api/tasks",
+          "PATCH /api/tasks/:taskId",
+          "DELETE /api/tasks/:taskId",
           "POST /slack/commands/clickup-task"
         ]
       });
@@ -131,6 +134,9 @@ const server = http.createServer(async (req, res) => {
           runDemo: "POST /api/run-demo",
           testConnection: "POST /api/test-connection",
           directWorkflowTest: "POST /api/create-clickup-task",
+          activeTasks: "GET /api/tasks?connectionId=...&page=0",
+          updateTask: "PATCH /api/tasks/:taskId",
+          deleteTask: "DELETE /api/tasks/:taskId?connectionId=...",
           slackSlashCommand: "POST /slack/commands/clickup-task"
         },
         commandSyntax: {
@@ -201,7 +207,8 @@ const server = http.createServer(async (req, res) => {
           clickup: Boolean(fallback?.clickupToken && fallback?.clickupListId),
           slack: Boolean(fallback?.slackBotToken),
           slackSigning: Boolean(process.env.SLACK_SIGNING_SECRET)
-        }
+        },
+        taskManagementAdminConfigured: Boolean(process.env.TASKAPP_ADMIN_KEY)
       });
     }
 
@@ -226,6 +233,54 @@ const server = http.createServer(async (req, res) => {
       });
 
       return sendJson(res, 200, result);
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/tasks") {
+      const auth = verifyTaskAdminRequest(req);
+      if (!auth.ok) return sendJson(res, auth.status, auth);
+
+      const connection = findConnectionForRequest({
+        connectionId: url.searchParams.get("connectionId"),
+        allowDefault: true
+      });
+      const page = parseTaskPage(url.searchParams.get("page"));
+      if (page === null) return sendJson(res, 400, { ok: false, error: "Page must be a non-negative integer." });
+
+      const result = await listActiveTasks({ connection, page });
+      return sendJson(res, result.ok ? 200 : result.status || 502, result);
+    }
+
+    const taskRoute = url.pathname.match(/^\/api\/tasks\/([^/]+)$/);
+    if (taskRoute && req.method === "PATCH") {
+      const auth = verifyTaskAdminRequest(req);
+      if (!auth.ok) return sendJson(res, auth.status, auth);
+
+      const payload = parseJson(await readBody(req));
+      const connection = findConnectionForRequest({
+        connectionId: payload.connectionId,
+        allowDefault: true
+      });
+      const result = await updateManagedTask({
+        connection,
+        taskId: decodeURIComponent(taskRoute[1]),
+        changes: payload
+      });
+      return sendJson(res, result.ok ? 200 : result.status || 502, result);
+    }
+
+    if (taskRoute && req.method === "DELETE") {
+      const auth = verifyTaskAdminRequest(req);
+      if (!auth.ok) return sendJson(res, auth.status, auth);
+
+      const connection = findConnectionForRequest({
+        connectionId: url.searchParams.get("connectionId"),
+        allowDefault: true
+      });
+      const result = await deleteManagedTask({
+        connection,
+        taskId: decodeURIComponent(taskRoute[1])
+      });
+      return sendJson(res, result.ok ? 200 : result.status || 502, result);
     }
 
     if (req.method === "POST" && url.pathname === "/slack/commands/clickup-task") {
@@ -412,6 +467,231 @@ async function createClickUpTask(input, options = {}) {
   };
 }
 
+async function listActiveTasks({ connection, page }) {
+  const validationError = validateTaskManagementConnection(connection);
+  if (validationError) return { ok: false, status: 400, error: validationError };
+
+  const query = new URLSearchParams({
+    archived: "false",
+    include_closed: "false",
+    page: String(page),
+    order_by: "updated",
+    reverse: "true"
+  });
+
+  const [tasksResponse, listResponse, membersResponse] = await Promise.all([
+    clickUpRequest(connection, "GET", `/list/${connection.clickupListId}/task?${query}`),
+    clickUpRequest(connection, "GET", `/list/${connection.clickupListId}`),
+    clickUpRequest(connection, "GET", `/list/${connection.clickupListId}/member`)
+  ]);
+
+  const failed = [tasksResponse, listResponse, membersResponse].find((response) => !response.ok);
+  if (failed) return failed;
+
+  const rawTasks = tasksResponse.data.tasks || [];
+  const tasks = rawTasks
+    .filter(Boolean)
+    .map(normalizeManagedTask)
+    .filter((task) => !task.archived && task.statusType !== "closed");
+  return {
+    ok: true,
+    connection: sanitizeConnection(connection),
+    list: {
+      id: String(connection.clickupListId),
+      name: listResponse.data.name || null
+    },
+    tasks,
+    statuses: normalizeClickUpStatuses(listResponse.data.statuses),
+    assignees: normalizeClickUpMembers(membersResponse.data),
+    page,
+    hasMore: rawTasks.length === 100
+  };
+}
+
+async function updateManagedTask({ connection, taskId, changes }) {
+  const validationError = validateTaskManagementConnection(connection);
+  if (validationError) return { ok: false, status: 400, error: validationError };
+  if (!taskId) return { ok: false, status: 400, error: "Missing task ID." };
+
+  const currentResponse = await clickUpRequest(connection, "GET", `/task/${encodeURIComponent(taskId)}`);
+  if (!currentResponse.ok) return currentResponse;
+  const currentTask = currentResponse.data;
+  const membershipError = validateTaskListMembership(currentTask, connection);
+  if (membershipError) return { ok: false, status: 403, error: membershipError };
+
+  const body = {};
+  if (Object.prototype.hasOwnProperty.call(changes, "name")) {
+    const name = String(changes.name || "").trim();
+    if (!name) return { ok: false, status: 400, error: "Task title cannot be empty." };
+    body.name = name;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(changes, "due")) {
+    if (changes.due === null || String(changes.due).trim() === "") {
+      body.due_date = null;
+    } else {
+      const dueDate = parseManagedDueDate(changes.due);
+      if (dueDate === null) {
+        return { ok: false, status: 400, error: "Due date must be today, tomorrow, or YYYY-MM-DD." };
+      }
+      body.due_date = dueDate;
+      body.due_date_time = false;
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(changes, "status")) {
+    const listResponse = await clickUpRequest(connection, "GET", `/list/${connection.clickupListId}`);
+    if (!listResponse.ok) return listResponse;
+    const statuses = normalizeClickUpStatuses(listResponse.data.statuses);
+    const requestedStatus = String(changes.status || "").trim().toLowerCase();
+    const status = statuses.find((item) => item.name.toLowerCase() === requestedStatus);
+    if (!status) {
+      return {
+        ok: false,
+        status: 400,
+        error: `Unknown status "${changes.status}". Valid statuses: ${statuses.map((item) => item.name).join(", ")}.`
+      };
+    }
+    body.status = status.name;
+  }
+
+  if (Object.prototype.hasOwnProperty.call(changes, "assignees")) {
+    const desired = resolveClickUpAssignees(changes.assignees, connection.assigneeAliases);
+    if (!desired.ok) return { ok: false, status: 400, error: desired.error };
+    const currentIds = (currentTask.assignees || []).map((assignee) => Number(assignee.id)).filter(Number.isFinite);
+    body.assignees = {
+      add: desired.ids.filter((id) => !currentIds.includes(id)),
+      rem: currentIds.filter((id) => !desired.ids.includes(id))
+    };
+  }
+
+  if (!Object.keys(body).length) {
+    return { ok: false, status: 400, error: "Provide at least one field to update: name, due, assignees, or status." };
+  }
+
+  const updateResponse = await clickUpRequest(
+    connection,
+    "PUT",
+    `/task/${encodeURIComponent(taskId)}`,
+    body
+  );
+  if (!updateResponse.ok) return updateResponse;
+
+  return {
+    ok: true,
+    connection: sanitizeConnection(connection),
+    requested: {
+      name: body.name,
+      due: Object.prototype.hasOwnProperty.call(body, "due_date") ? changes.due : undefined,
+      assignees: Object.prototype.hasOwnProperty.call(changes, "assignees") ? normalizeList(changes.assignees) : undefined,
+      status: body.status
+    },
+    task: normalizeManagedTask(updateResponse.data)
+  };
+}
+
+async function deleteManagedTask({ connection, taskId }) {
+  const validationError = validateTaskManagementConnection(connection);
+  if (validationError) return { ok: false, status: 400, error: validationError };
+  if (!taskId) return { ok: false, status: 400, error: "Missing task ID." };
+
+  const currentResponse = await clickUpRequest(connection, "GET", `/task/${encodeURIComponent(taskId)}`);
+  if (!currentResponse.ok) return currentResponse;
+  const membershipError = validateTaskListMembership(currentResponse.data, connection);
+  if (membershipError) return { ok: false, status: 403, error: membershipError };
+
+  const deleteResponse = await clickUpRequest(connection, "DELETE", `/task/${encodeURIComponent(taskId)}`);
+  if (!deleteResponse.ok) return deleteResponse;
+
+  return {
+    ok: true,
+    connection: sanitizeConnection(connection),
+    deletedTask: {
+      id: String(taskId),
+      name: currentResponse.data.name || null
+    }
+  };
+}
+
+function validateTaskManagementConnection(connection) {
+  if (!connection) return "No integration connection found. Connect ClickUp in the setup page.";
+  if (!connection.clickupToken) return "Missing ClickUp token for this connection.";
+  if (!connection.clickupListId) return "Missing ClickUp List ID for this connection.";
+  return null;
+}
+
+function validateTaskListMembership(task, connection) {
+  const taskListId = task.list?.id;
+  if (!taskListId || String(taskListId) !== String(connection.clickupListId)) {
+    return "This task does not belong to the configured ClickUp List.";
+  }
+  return null;
+}
+
+function normalizeManagedTask(task) {
+  return {
+    id: String(task.id),
+    name: task.name || "Untitled task",
+    status: task.status?.status || null,
+    statusType: task.status?.type || null,
+    dueDate: task.due_date ? Number(task.due_date) : null,
+    assignees: (task.assignees || []).map((assignee) => ({
+      id: Number(assignee.id),
+      username: assignee.username || assignee.email || String(assignee.id)
+    })),
+    archived: Boolean(task.archived),
+    url: task.url || `https://app.clickup.com/t/${task.id}`
+  };
+}
+
+function normalizeClickUpStatuses(statuses) {
+  return (statuses || [])
+    .filter((status) => status?.status)
+    .map((status) => ({
+      name: status.status,
+      type: status.type || null,
+      color: status.color || null,
+      order: Number(status.orderindex || 0)
+    }))
+    .sort((a, b) => a.order - b.order);
+}
+
+function normalizeClickUpMembers(data) {
+  return (data.members || data.users || [])
+    .map((entry) => entry.user || entry)
+    .filter((member) => member?.id)
+    .map((member) => ({
+      id: Number(member.id),
+      username: member.username || member.email || member.name || String(member.id)
+    }))
+    .sort((a, b) => a.username.localeCompare(b.username));
+}
+
+async function clickUpRequest(connection, method, apiPath, body) {
+  try {
+    const response = await fetch(`${CLICKUP_API_BASE}${apiPath}`, {
+      method,
+      headers: {
+        Authorization: connection.clickupToken,
+        "Content-Type": "application/json"
+      },
+      body: body === undefined ? undefined : JSON.stringify(body)
+    });
+    const data = response.status === 204 ? {} : await response.json().catch(() => ({}));
+    if (!response.ok) {
+      const retryAfter = response.headers.get("retry-after");
+      return {
+        ok: false,
+        status: [400, 401, 403, 404, 429].includes(response.status) ? response.status : 502,
+        error: `ClickUp API error (${response.status}): ${data.err || data.error || response.statusText}${retryAfter ? `. Retry after ${retryAfter} seconds.` : ""}`
+      };
+    }
+    return { ok: true, data };
+  } catch (error) {
+    return { ok: false, status: 502, error: `ClickUp request failed: ${error.message}` };
+  }
+}
+
 async function postSlackMessage({ connection, channel, text }) {
   if (!channel) {
     return { skipped: true, reason: "No Slack channel provided." };
@@ -444,7 +724,10 @@ function findConnectionForRequest({ connectionId, teamId, allowDefault }) {
   const connections = store.connections.map(normalizeStoredConnection);
 
   if (connectionId) {
-    return connections.find((connection) => connection.id === connectionId) || null;
+    const match = connections.find((connection) => connection.id === connectionId);
+    if (match) return match;
+    if (connectionId === "env-fallback") return buildEnvConnection();
+    return null;
   }
 
   if (teamId) {
@@ -844,6 +1127,8 @@ function renderSetupPage(url) {
   const store = loadConnectionStore();
   const connections = store.connections.map(normalizeStoredConnection);
   const fallback = buildEnvConnection();
+  const taskConnections = [...connections];
+  if (fallback) taskConnections.push(fallback);
   const error = url.searchParams.get("error");
   const saved = url.searchParams.get("saved");
   const reset = url.searchParams.get("reset");
@@ -869,6 +1154,7 @@ function renderSetupPage(url) {
     <nav class="tabs" aria-label="Setup sections">
       <button type="button" class="${setupTabClass(activeTab, "workflow")}" data-tab="workflow">Workflow</button>
       <button type="button" class="${setupTabClass(activeTab, "connections")}" data-tab="connections">Connections</button>
+      <button type="button" class="${setupTabClass(activeTab, "tasks")}" data-tab="tasks">Tasks</button>
       <button type="button" class="${setupTabClass(activeTab, "test")}" data-tab="test">Test</button>
       <button type="button" class="${setupTabClass(activeTab, "demo-tools")}" data-tab="demo-tools">Demo Tools</button>
     </nav>
@@ -934,6 +1220,7 @@ function renderSetupPage(url) {
         ${renderStatusCard("Slack OAuth App", process.env.SLACK_CLIENT_ID && process.env.SLACK_CLIENT_SECRET)}
         ${renderStatusCard("Slack Signing", process.env.SLACK_SIGNING_SECRET)}
         ${renderStatusCard("ClickUp OAuth App", process.env.CLICKUP_CLIENT_ID && process.env.CLICKUP_CLIENT_SECRET)}
+        ${renderStatusCard("Task Admin", process.env.TASKAPP_ADMIN_KEY, "Protects task query and mutations")}
         ${renderStatusCard("Workflow Connections", connections.length, `${connections.length} saved workflow connection${connections.length === 1 ? "" : "s"}`)}
         ${renderStatusCard("Env Fallback", fallback)}
       </div>
@@ -950,6 +1237,31 @@ function renderSetupPage(url) {
         </details>
       </div>
       ${connections.length ? connections.map(renderConnectionForm).join("") : `<div class="card"><p>No runtime connections yet. Install Slack and connect ClickUp to create one.</p></div>`}
+    </section>
+
+    <section class="${setupPanelClass(activeTab, "tasks")}" id="tasks">
+      <div class="task-toolbar">
+        <div>
+          <p class="eyebrow">ClickUp task management</p>
+          <h2>Active Tasks</h2>
+          <p class="muted">View and manage non-closed, non-archived tasks in the selected ClickUp List.</p>
+        </div>
+        <div class="task-toolbar-controls">
+          <label>
+            Connection
+            <select id="task-connection">${renderTaskConnectionOptions(taskConnections)}</select>
+          </label>
+          <label>
+            Admin key
+            <input id="task-admin-key" type="password" autocomplete="off" placeholder="TASKAPP_ADMIN_KEY" />
+          </label>
+          <button type="button" id="load-tasks-button" onclick="unlockTaskManager()">Load Tasks</button>
+        </div>
+      </div>
+      ${taskConnections.length ? "" : `<div class="card"><p>No ClickUp connection is available. Connect ClickUp or configure the env fallback first.</p></div>`}
+      <p id="task-feedback" class="task-feedback" role="status" aria-live="polite"></p>
+      <div id="task-list" class="task-list" aria-live="polite"></div>
+      <button type="button" id="load-more-tasks" class="secondary" hidden onclick="loadMoreTasks()">Load More</button>
     </section>
 
     <section class="${setupPanelClass(activeTab, "test")}" id="test">
@@ -995,6 +1307,42 @@ function renderSetupPage(url) {
       href: "/setup/clickup/connect",
       cta: "Continue to ClickUp"
     })}
+    <div class="modal-backdrop" id="task-edit-modal" role="dialog" aria-modal="true" aria-labelledby="task-edit-title">
+      <div class="modal">
+        <h2 id="task-edit-title">Edit ClickUp Task</h2>
+        <form id="task-edit-form" onsubmit="saveTaskEdits(event)">
+          <input type="hidden" id="edit-task-id" />
+          <label>
+            Title
+            <input id="edit-task-name" required />
+          </label>
+          <label>
+            Due date
+            <input id="edit-task-due" type="date" />
+          </label>
+          <fieldset>
+            <legend>Assignees</legend>
+            <div id="edit-task-assignees"></div>
+          </fieldset>
+          <p class="modal-actions">
+            <button type="submit">Save Changes</button>
+            <button type="button" class="secondary" onclick="closeModal('task-edit-modal')">Cancel</button>
+          </p>
+        </form>
+      </div>
+    </div>
+    <div class="modal-backdrop" id="task-delete-modal" role="dialog" aria-modal="true" aria-labelledby="task-delete-title">
+      <div class="modal">
+        <h2 id="task-delete-title">Delete ClickUp Task</h2>
+        <p>Delete <strong id="delete-task-name"></strong> permanently?</p>
+        <p class="error">This action cannot be undone.</p>
+        <input type="hidden" id="delete-task-id" />
+        <p class="modal-actions">
+          <button type="button" class="danger-button" onclick="confirmTaskDelete()">Delete Task</button>
+          <button type="button" class="secondary" onclick="closeModal('task-delete-modal')">Cancel</button>
+        </p>
+      </div>
+    </div>
   `);
 }
 
@@ -1010,8 +1358,17 @@ function renderStatusCard(label, value, detail) {
 }
 
 function normalizeSetupTab(tab) {
-  const tabs = new Set(["workflow", "connections", "test", "demo-tools"]);
+  const tabs = new Set(["workflow", "connections", "tasks", "test", "demo-tools"]);
   return tabs.has(tab) ? tab : "workflow";
+}
+
+function renderTaskConnectionOptions(connections) {
+  if (!connections.length) return `<option value="">No ClickUp connections</option>`;
+  return connections.map((connection) => {
+    const ready = Boolean(connection.clickupToken && connection.clickupListId);
+    const label = `${connection.name}${ready ? "" : " (needs ClickUp List)"}`;
+    return `<option value="${escapeHtml(connection.id)}"${ready ? "" : " disabled"}>${escapeHtml(label)}</option>`;
+  }).join("");
 }
 
 function setupTabClass(activeTab, tab) {
@@ -1185,6 +1542,25 @@ function htmlPage(title, body) {
     .grid, .status-grid { display: grid; gap: 14px; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
     .connection-status-grid { margin: 12px 0 18px; }
     .connection-status-grid .status-card { margin: 0; }
+    .task-toolbar { align-items: end; display: flex; gap: 18px; justify-content: space-between; }
+    .task-toolbar h2 { font-size: 26px; margin: 2px 0 0; }
+    .task-toolbar-controls { align-items: end; display: grid; gap: 10px; grid-template-columns: minmax(190px, 1fr) minmax(190px, 1fr) auto; min-width: 560px; }
+    .task-toolbar-controls label { margin: 0; }
+    .task-feedback { min-height: 24px; }
+    .task-feedback.is-success { color: #047857; font-weight: 700; }
+    .task-feedback.is-error { color: #b91c1c; font-weight: 700; }
+    .task-table-wrap { border: 1px solid #cbd5e1; border-radius: 8px; overflow-x: auto; }
+    .task-table { background: white; border-collapse: collapse; min-width: 820px; width: 100%; }
+    .task-table th, .task-table td { border-bottom: 1px solid #e2e8f0; padding: 12px; text-align: left; vertical-align: middle; }
+    .task-table th { background: #f1f5f9; color: #475569; font-size: 12px; text-transform: uppercase; }
+    .task-table tr:last-child td { border-bottom: 0; }
+    .task-title { color: #0f172a; font-weight: 700; text-decoration: none; }
+    .task-title:hover { text-decoration: underline; }
+    .task-assignees { color: #475569; font-size: 14px; }
+    .task-actions { white-space: nowrap; }
+    .task-actions button { margin-bottom: 4px; }
+    .task-empty { background: white; border: 1px solid #cbd5e1; border-radius: 8px; padding: 28px; text-align: center; }
+    .danger-button { background: #b91c1c; }
     .workflow-heading { align-items: end; display: flex; gap: 16px; justify-content: space-between; margin: 6px 0 22px; }
     .workflow-heading h2 { font-size: 26px; margin: 2px 0 0; }
     .eyebrow, .detail-label { color: #475569; font-size: 12px; font-weight: 800; letter-spacing: 0; margin: 0; text-transform: uppercase; }
@@ -1235,6 +1611,8 @@ function htmlPage(title, body) {
       .workflow-connector::before { bottom: 8px; height: auto; left: 50%; right: auto; top: 8px; width: 2px; }
       .workflow-connector::after { border-left: 5px solid transparent; border-right: 5px solid transparent; border-top: 7px solid #64748b; bottom: 4px; left: calc(50% - 4px); right: auto; top: auto; }
       .workflow-connector span { max-width: 120px; }
+      .task-toolbar { align-items: stretch; flex-direction: column; }
+      .task-toolbar-controls { min-width: 0; }
     }
     @media (max-width: 640px) {
       body { padding: 20px; }
@@ -1242,6 +1620,7 @@ function htmlPage(title, body) {
       .workflow-badge { white-space: normal; }
       .workflow-details { grid-template-columns: 1fr; }
       .workflow-details > div + div { border-left: 0; border-top: 1px solid #cbd5e1; }
+      .task-toolbar-controls { grid-template-columns: 1fr; }
     }
   </style>
   <script>
@@ -1257,6 +1636,7 @@ function htmlPage(title, body) {
       const id = tab.getAttribute("data-tab");
       document.querySelectorAll(".tab").forEach((item) => item.classList.toggle("is-active", item === tab));
       document.querySelectorAll(".tab-panel").forEach((panel) => panel.classList.toggle("is-active", panel.id === id));
+      if (id === "tasks") prepareTaskManager();
     });
     document.addEventListener("submit", async function(event) {
       const form = event.target.closest(".connection-settings-form");
@@ -1290,6 +1670,312 @@ function htmlPage(title, body) {
         button.disabled = false;
       }
     });
+
+    const taskState = {
+      tasks: [],
+      statuses: [],
+      assignees: [],
+      page: 0,
+      hasMore: false
+    };
+
+    document.addEventListener("DOMContentLoaded", function() {
+      const connection = document.getElementById("task-connection");
+      if (connection) connection.addEventListener("change", function() {
+        taskState.tasks = [];
+        if (getTaskAdminKey()) loadTasks(0, false);
+      });
+      if (document.getElementById("tasks")?.classList.contains("is-active")) prepareTaskManager();
+    });
+
+    function prepareTaskManager() {
+      const input = document.getElementById("task-admin-key");
+      if (!input) return;
+      const storedKey = sessionStorage.getItem("taskappAdminKey") || "";
+      if (!input.value && storedKey) input.value = storedKey;
+      if (storedKey && !taskState.tasks.length) loadTasks(0, false);
+    }
+
+    function getTaskAdminKey() {
+      return document.getElementById("task-admin-key")?.value.trim() || "";
+    }
+
+    function unlockTaskManager() {
+      const key = getTaskAdminKey();
+      if (!key) {
+        setTaskFeedback("Enter the task management admin key.", "error");
+        document.getElementById("task-admin-key")?.focus();
+        return;
+      }
+      sessionStorage.setItem("taskappAdminKey", key);
+      loadTasks(0, false);
+    }
+
+    async function taskApi(path, options) {
+      const key = getTaskAdminKey() || sessionStorage.getItem("taskappAdminKey") || "";
+      const response = await fetch(path, {
+        ...options,
+        headers: {
+          "Accept": "application/json",
+          "Content-Type": "application/json",
+          "X-TaskApp-Admin-Key": key,
+          ...(options?.headers || {})
+        }
+      });
+      const data = await response.json().catch(() => ({ ok: false, error: "Invalid server response." }));
+      if (!response.ok || !data.ok) {
+        if (response.status === 401) sessionStorage.removeItem("taskappAdminKey");
+        throw new Error(data.error || "Task request failed.");
+      }
+      return data;
+    }
+
+    async function loadTasks(page, append) {
+      const connectionId = document.getElementById("task-connection")?.value;
+      if (!connectionId) {
+        setTaskFeedback("Choose a configured ClickUp connection.", "error");
+        return;
+      }
+
+      setTaskFeedback("Loading active tasks...");
+      setTaskControlsDisabled(true);
+      try {
+        const data = await taskApi("/api/tasks?connectionId=" + encodeURIComponent(connectionId) + "&page=" + page, { method: "GET" });
+        taskState.tasks = append ? taskState.tasks.concat(data.tasks) : data.tasks;
+        taskState.statuses = data.statuses;
+        taskState.assignees = data.assignees;
+        taskState.page = data.page;
+        taskState.hasMore = data.hasMore;
+        renderTaskTable();
+        setTaskFeedback(taskState.tasks.length + " active task" + (taskState.tasks.length === 1 ? "" : "s") + " loaded.", "success");
+      } catch (error) {
+        setTaskFeedback(error.message, "error");
+      } finally {
+        setTaskControlsDisabled(false);
+      }
+    }
+
+    function loadMoreTasks() {
+      loadTasks(taskState.page + 1, true);
+    }
+
+    function setTaskControlsDisabled(disabled) {
+      const loadButton = document.getElementById("load-tasks-button");
+      const moreButton = document.getElementById("load-more-tasks");
+      if (loadButton) loadButton.disabled = disabled;
+      if (moreButton) moreButton.disabled = disabled;
+    }
+
+    function setTaskFeedback(message, type) {
+      const feedback = document.getElementById("task-feedback");
+      if (!feedback) return;
+      feedback.textContent = message || "";
+      feedback.className = "task-feedback" + (type ? " is-" + type : "");
+    }
+
+    function renderTaskTable() {
+      const container = document.getElementById("task-list");
+      const loadMore = document.getElementById("load-more-tasks");
+      if (!container || !loadMore) return;
+      container.replaceChildren();
+      loadMore.hidden = !taskState.hasMore;
+
+      if (!taskState.tasks.length) {
+        const empty = document.createElement("div");
+        empty.className = "task-empty";
+        empty.textContent = "No active tasks found in this ClickUp List.";
+        container.appendChild(empty);
+        return;
+      }
+
+      const wrap = document.createElement("div");
+      wrap.className = "task-table-wrap";
+      const table = document.createElement("table");
+      table.className = "task-table";
+      const head = document.createElement("thead");
+      const headRow = document.createElement("tr");
+      ["Task", "Status", "Assignees", "Due date", "Actions"].forEach(function(label) {
+        const cell = document.createElement("th");
+        cell.textContent = label;
+        headRow.appendChild(cell);
+      });
+      head.appendChild(headRow);
+      table.appendChild(head);
+
+      const body = document.createElement("tbody");
+      taskState.tasks.forEach(function(task) {
+        const row = document.createElement("tr");
+        row.dataset.taskId = task.id;
+
+        const titleCell = document.createElement("td");
+        const title = document.createElement("a");
+        title.className = "task-title";
+        title.href = task.url;
+        title.target = "_blank";
+        title.rel = "noreferrer";
+        title.textContent = task.name;
+        titleCell.appendChild(title);
+
+        const statusCell = document.createElement("td");
+        const status = document.createElement("select");
+        status.setAttribute("aria-label", "Status for " + task.name);
+        taskState.statuses.forEach(function(item) {
+          const option = document.createElement("option");
+          option.value = item.name;
+          option.textContent = item.name;
+          option.selected = item.name.toLowerCase() === String(task.status || "").toLowerCase();
+          status.appendChild(option);
+        });
+        status.addEventListener("change", function() { updateTaskStatus(task.id, status.value, status); });
+        statusCell.appendChild(status);
+
+        const assigneeCell = document.createElement("td");
+        assigneeCell.className = "task-assignees";
+        assigneeCell.textContent = task.assignees.length ? task.assignees.map(function(item) { return item.username; }).join(", ") : "Unassigned";
+
+        const dueCell = document.createElement("td");
+        dueCell.textContent = formatTaskDueDate(task.dueDate);
+
+        const actionsCell = document.createElement("td");
+        actionsCell.className = "task-actions";
+        const editButton = document.createElement("button");
+        editButton.type = "button";
+        editButton.className = "secondary";
+        editButton.textContent = "Edit";
+        editButton.addEventListener("click", function() { openTaskEdit(task.id); });
+        const deleteButton = document.createElement("button");
+        deleteButton.type = "button";
+        deleteButton.className = "danger-button";
+        deleteButton.textContent = "Delete";
+        deleteButton.addEventListener("click", function() { openTaskDelete(task.id); });
+        actionsCell.append(editButton, deleteButton);
+
+        row.append(titleCell, statusCell, assigneeCell, dueCell, actionsCell);
+        body.appendChild(row);
+      });
+      table.appendChild(body);
+      wrap.appendChild(table);
+      container.appendChild(wrap);
+    }
+
+    function formatTaskDueDate(value) {
+      if (!value) return "No due date";
+      return new Intl.DateTimeFormat(undefined, { year: "numeric", month: "short", day: "numeric" }).format(new Date(value));
+    }
+
+    function formatTaskDateInput(value) {
+      if (!value) return "";
+      const date = new Date(value);
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, "0");
+      const day = String(date.getDate()).padStart(2, "0");
+      return year + "-" + month + "-" + day;
+    }
+
+    function replaceManagedTask(updatedTask) {
+      if (updatedTask.archived || updatedTask.statusType === "closed") {
+        taskState.tasks = taskState.tasks.filter(function(task) { return task.id !== updatedTask.id; });
+      } else {
+        taskState.tasks = taskState.tasks.map(function(task) { return task.id === updatedTask.id ? updatedTask : task; });
+      }
+      renderTaskTable();
+    }
+
+    async function updateTaskStatus(taskId, status, select) {
+      select.disabled = true;
+      try {
+        const data = await updateTaskRequest(taskId, { status: status });
+        replaceManagedTask(data.task);
+        setTaskFeedback("Task status updated to " + status + ".", "success");
+      } catch (error) {
+        setTaskFeedback(error.message, "error");
+        renderTaskTable();
+      }
+    }
+
+    function openTaskEdit(taskId) {
+      const task = taskState.tasks.find(function(item) { return item.id === taskId; });
+      if (!task) return;
+      document.getElementById("edit-task-id").value = task.id;
+      document.getElementById("edit-task-name").value = task.name;
+      document.getElementById("edit-task-due").value = formatTaskDateInput(task.dueDate);
+      const selectedIds = new Set(task.assignees.map(function(item) { return Number(item.id); }));
+      const container = document.getElementById("edit-task-assignees");
+      container.replaceChildren();
+      if (!taskState.assignees.length) {
+        const empty = document.createElement("p");
+        empty.className = "muted";
+        empty.textContent = "No ClickUp members are available for this List.";
+        container.appendChild(empty);
+      }
+      taskState.assignees.forEach(function(member) {
+        const label = document.createElement("label");
+        label.className = "checkbox-label";
+        const checkbox = document.createElement("input");
+        checkbox.type = "checkbox";
+        checkbox.name = "taskAssignee";
+        checkbox.value = String(member.id);
+        checkbox.checked = selectedIds.has(Number(member.id));
+        label.append(checkbox, document.createTextNode(member.username));
+        container.appendChild(label);
+      });
+      openModal("task-edit-modal");
+    }
+
+    async function saveTaskEdits(event) {
+      event.preventDefault();
+      const taskId = document.getElementById("edit-task-id").value;
+      const assignees = Array.from(document.querySelectorAll("#edit-task-assignees input:checked")).map(function(input) { return input.value; });
+      const submit = event.target.querySelector("button[type='submit']");
+      submit.disabled = true;
+      try {
+        const data = await updateTaskRequest(taskId, {
+          name: document.getElementById("edit-task-name").value,
+          due: document.getElementById("edit-task-due").value || null,
+          assignees: assignees
+        });
+        replaceManagedTask(data.task);
+        closeModal("task-edit-modal");
+        setTaskFeedback("Task properties updated.", "success");
+      } catch (error) {
+        setTaskFeedback(error.message, "error");
+      } finally {
+        submit.disabled = false;
+      }
+    }
+
+    function updateTaskRequest(taskId, changes) {
+      return taskApi("/api/tasks/" + encodeURIComponent(taskId), {
+        method: "PATCH",
+        body: JSON.stringify({
+          connectionId: document.getElementById("task-connection").value,
+          ...changes
+        })
+      });
+    }
+
+    function openTaskDelete(taskId) {
+      const task = taskState.tasks.find(function(item) { return item.id === taskId; });
+      if (!task) return;
+      document.getElementById("delete-task-id").value = task.id;
+      document.getElementById("delete-task-name").textContent = task.name;
+      openModal("task-delete-modal");
+    }
+
+    async function confirmTaskDelete() {
+      const taskId = document.getElementById("delete-task-id").value;
+      const connectionId = document.getElementById("task-connection").value;
+      try {
+        const data = await taskApi("/api/tasks/" + encodeURIComponent(taskId) + "?connectionId=" + encodeURIComponent(connectionId), { method: "DELETE" });
+        taskState.tasks = taskState.tasks.filter(function(task) { return task.id !== taskId; });
+        renderTaskTable();
+        closeModal("task-delete-modal");
+        setTaskFeedback("Deleted " + (data.deletedTask.name || "task") + ".", "success");
+      } catch (error) {
+        setTaskFeedback(error.message, "error");
+      }
+    }
+
     async function testConnection(connectionId) {
       const response = await fetch("/api/test-connection", {
         method: "POST",
@@ -1458,6 +2144,23 @@ function normalizePriority(priority) {
   return priorities[value] || priorities.normal;
 }
 
+function parseTaskPage(value) {
+  const page = value === null || value === "" ? 0 : Number(value);
+  return Number.isInteger(page) && page >= 0 ? page : null;
+}
+
+function parseManagedDueDate(due) {
+  const value = String(due || "").trim().toLowerCase();
+  if (!value) return null;
+  if (value === "today" || value === "tomorrow") return parseDueDate(value);
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(value)) return null;
+
+  const [year, month, day] = value.split("-").map(Number);
+  const date = new Date(year, month - 1, day, 23, 59, 59, 999);
+  if (date.getFullYear() !== year || date.getMonth() !== month - 1 || date.getDate() !== day) return null;
+  return date.getTime();
+}
+
 function parseDueDate(due) {
   if (!due) return null;
 
@@ -1496,6 +2199,27 @@ function verifySlackRequest(req, rawBody) {
   const digest = `v0=${crypto.createHmac("sha256", signingSecret).update(base).digest("hex")}`;
 
   return crypto.timingSafeEqual(Buffer.from(digest), Buffer.from(signature));
+}
+
+function verifyTaskAdminRequest(req) {
+  const expected = process.env.TASKAPP_ADMIN_KEY;
+  if (!expected) {
+    return {
+      ok: false,
+      status: 503,
+      error: "Task management is unavailable because TASKAPP_ADMIN_KEY is not configured."
+    };
+  }
+
+  const provided = String(req.headers["x-taskapp-admin-key"] || "");
+  const expectedBuffer = Buffer.from(expected);
+  const providedBuffer = Buffer.from(provided);
+  if (expectedBuffer.length !== providedBuffer.length
+    || !crypto.timingSafeEqual(expectedBuffer, providedBuffer)) {
+    return { ok: false, status: 401, error: "Invalid task management admin key." };
+  }
+
+  return { ok: true };
 }
 
 function readBody(req) {

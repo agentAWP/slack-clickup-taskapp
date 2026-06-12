@@ -20,6 +20,8 @@ Live deployment:
 - Provides `POST /api/run-demo` as a stable env-backed fallback demo path.
 - Provides `POST /api/test-connection` for testing a runtime connection.
 - Exposes `POST /api/create-clickup-task` for direct testing; this endpoint creates a ClickUp task and posts a Slack message.
+- Provides a protected **Tasks** tab for listing, editing, changing status, and permanently deleting active ClickUp tasks.
+- Exposes protected task-management endpoints under `/api/tasks`.
 - Exposes `GET /health` and `GET /demo` for live inspection.
 
 Example Slack command:
@@ -54,6 +56,7 @@ Fill in app-level values:
 PORT=3000
 APP_BASE_URL=http://localhost:3000
 DATA_FILE=data/connections.json
+TASKAPP_ADMIN_KEY=choose-a-long-random-admin-key
 SLACK_SIGNING_SECRET=your-signing-secret
 SLACK_CLIENT_ID=your-slack-client-id
 SLACK_CLIENT_SECRET=your-slack-client-secret
@@ -114,8 +117,8 @@ http://localhost:3000/oauth/clickup/callback
 For deployed Render:
 
 ```text
-https://YOUR_RENDER_APP.onrender.com/oauth/slack/callback
-https://YOUR_RENDER_APP.onrender.com/oauth/clickup/callback
+https://slack-clickup-taskapp.onrender.com/oauth/slack/callback
+https://slack-clickup-taskapp.onrender.com/oauth/clickup/callback
 ```
 
 Setup flow:
@@ -139,6 +142,55 @@ The setup page also includes:
 - **Run Demo**: uses the env fallback connection to create a known-good demo task.
 - **Test Runtime Connection**: creates a test task through the selected runtime connection.
 - **Clear Runtime Connections**: clears OAuth-created runtime connections without changing env fallback settings.
+- **Tasks**: securely lists and manages active tasks in the selected ClickUp List.
+
+## Task management
+
+The **Tasks** tab displays non-archived tasks whose status is not closed. Task data remains authoritative in ClickUp and does not depend on Render filesystem persistence.
+
+Set a long random value locally and in Render:
+
+```text
+TASKAPP_ADMIN_KEY=your-long-random-value
+```
+
+The Tasks tab asks for this key and stores it only in the browser's `sessionStorage`. The JSON endpoints require the same value in the `X-TaskApp-Admin-Key` header.
+
+List active tasks:
+
+```bash
+curl --request GET \
+  --url "https://slack-clickup-taskapp.onrender.com/api/tasks?connectionId=env-fallback&page=0" \
+  --header "X-TaskApp-Admin-Key: YOUR_ADMIN_KEY"
+```
+
+Update title, due date, final assignee selection, or status:
+
+```bash
+curl --request PATCH \
+  --url "https://slack-clickup-taskapp.onrender.com/api/tasks/TASK_ID" \
+  --header "Content-Type: application/json" \
+  --header "X-TaskApp-Admin-Key: YOUR_ADMIN_KEY" \
+  --data '{
+    "connectionId": "env-fallback",
+    "name": "Updated task title",
+    "due": "2026-06-15",
+    "assignees": [32644579],
+    "status": "in progress"
+  }'
+```
+
+The `assignees` array is the desired final selection. TaskApp compares it with the current task and sends ClickUp the necessary additions and removals. Use an empty array to make the task unassigned.
+
+Permanently delete a task:
+
+```bash
+curl --request DELETE \
+  --url "https://slack-clickup-taskapp.onrender.com/api/tasks/TASK_ID?connectionId=env-fallback" \
+  --header "X-TaskApp-Admin-Key: YOUR_ADMIN_KEY"
+```
+
+Deletion is permanent. The UI requires confirmation and names the task before sending the request.
 
 ## Direct workflow test
 
@@ -186,7 +238,7 @@ In the Slack app configuration, create a slash command:
 Set the request URL to:
 
 ```text
-https://YOUR_DEPLOYED_APP/slack/commands/clickup-task
+https://slack-clickup-taskapp.onrender.com/slack/commands/clickup-task
 ```
 
 Try this in Slack:
@@ -253,6 +305,7 @@ SLACK_CLIENT_SECRET
 SLACK_SIGNING_SECRET
 CLICKUP_CLIENT_ID
 CLICKUP_CLIENT_SECRET
+TASKAPP_ADMIN_KEY
 ```
 
 Optional fallback env vars:
@@ -268,7 +321,7 @@ CLICKUP_ASSIGNEE_ALIASES
 After deployment, update the Slack slash command Request URL to:
 
 ```text
-https://YOUR_RENDER_APP.onrender.com/slack/commands/clickup-task
+https://slack-clickup-taskapp.onrender.com/slack/commands/clickup-task
 ```
 
 Public inspection endpoints:
@@ -289,7 +342,7 @@ Runtime connection test endpoint:
 
 ```bash
 curl --request POST \
-  --url "https://YOUR_RENDER_APP.onrender.com/api/test-connection" \
+  --url "https://slack-clickup-taskapp.onrender.com/api/test-connection" \
   --header "Content-Type: application/json" \
   --data '{"connectionId":"runtime-connection-id","tags":["runtime","test"]}'
 ```
@@ -336,6 +389,10 @@ The app gracefully handles:
 - Missing ClickUp token or list ID for a connection.
 - Missing Slack bot token for a connection.
 - Unknown ClickUp assignee alias.
+- Invalid or missing task-management admin key.
+- Invalid task status or due date.
+- Attempts to update or delete a task outside the configured ClickUp List.
+- ClickUp rate limits, including retry guidance when available.
 - ClickUp API errors.
 - Slack API errors.
 - Invalid Slack request signatures when `SLACK_SIGNING_SECRET` is configured.
@@ -346,6 +403,7 @@ The app gracefully handles:
 - `data/` is ignored by Git because it can contain runtime tokens.
 - `.env.example` is safe to commit because it contains placeholders only.
 - App-level OAuth client secrets stay in environment variables.
+- Task-management endpoints require `TASKAPP_ADMIN_KEY`; the browser keeps it only for the current tab session.
 - Runtime integration tokens are stored in the connection store for this take-home. A production version should use encrypted storage.
 
 ## Assumptions
