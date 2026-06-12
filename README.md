@@ -8,6 +8,33 @@ Live deployment:
 - Health: https://slack-clickup-taskapp.onrender.com/health
 - Demo metadata: https://slack-clickup-taskapp.onrender.com/demo
 
+## Quick start
+
+Run locally:
+
+```bash
+cp .env.example .env
+# Fill in the required Slack and ClickUp values in .env
+npm start
+curl http://localhost:3000/health
+curl http://localhost:3000/demo
+```
+
+Inspect the deployed app over the web:
+
+```bash
+curl https://slack-clickup-taskapp.onrender.com/health
+curl https://slack-clickup-taskapp.onrender.com/demo
+```
+
+Open the in-product integration setup:
+
+```text
+https://slack-clickup-taskapp.onrender.com/setup
+```
+
+The public inspection commands above are non-destructive. The parameterized task-creation endpoint and Slack webhook are documented below.
+
 ## What it does
 
 - Accepts the Slack slash command `/taskapp` at `POST /slack/commands/clickup-task`.
