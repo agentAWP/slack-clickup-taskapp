@@ -1,5 +1,6 @@
 const assert = require("node:assert/strict");
 const { spawn } = require("node:child_process");
+const crypto = require("node:crypto");
 const http = require("node:http");
 const os = require("node:os");
 const path = require("node:path");
@@ -64,6 +65,7 @@ before(async () => {
       CLICKUP_LIST_ID: "list-1",
       CLICKUP_ASSIGNEE_ALIASES: "thomas:1,princess:2",
       SLACK_BOT_TOKEN: "xoxb-test",
+      SLACK_SIGNING_SECRET: "test-signing-secret",
       TASKAPP_ADMIN_KEY: "test-admin"
     },
     stdio: "ignore"
@@ -89,6 +91,34 @@ test("lists active tasks and task metadata", async () => {
   assert.deepEqual(data.tasks.map((task) => task.id), ["active"]);
   assert.deepEqual(data.statuses.map((status) => status.name), ["to do", "in progress", "complete"]);
   assert.deepEqual(data.assignees.map((member) => member.username), ["Princess", "Thomas"]);
+});
+
+test("signed Slack list command returns active tasks", async () => {
+  const body = new URLSearchParams({
+    command: "/taskapp",
+    text: "list",
+    team_id: "team-1",
+    channel_id: "channel-1",
+    user_id: "user-1"
+  }).toString();
+  const timestamp = String(Math.floor(Date.now() / 1000));
+  const signature = `v0=${crypto.createHmac("sha256", "test-signing-secret")
+    .update(`v0:${timestamp}:${body}`)
+    .digest("hex")}`;
+  const response = await fetch(`${appBaseUrl}/slack/commands/clickup-task`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "X-Slack-Request-Timestamp": timestamp,
+      "X-Slack-Signature": signature
+    },
+    body
+  });
+  const data = await response.json();
+  assert.equal(response.status, 200);
+  assert.match(data.text, /Active ClickUp tasks \(1\)/);
+  assert.match(data.text, /Active task/);
+  assert.doesNotMatch(data.text, /Closed task/);
 });
 
 test("updates title, due date, assignees, and status", async () => {

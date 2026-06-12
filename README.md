@@ -11,6 +11,7 @@ Live deployment:
 ## What it does
 
 - Accepts the Slack slash command `/taskapp` at `POST /slack/commands/clickup-task`.
+- Supports `/taskapp list` to return active tasks from the connected ClickUp List.
 - Verifies Slack requests with the Slack signing secret.
 - Lets integrations be connected/configured at runtime through `GET /setup`.
 - Shows modal-style confirmations before redirecting to Slack or ClickUp OAuth.
@@ -247,11 +248,20 @@ Try this in Slack:
 /taskapp Review FDE submission | assign: jay | tags: demo,interview | priority: high | due: tomorrow
 ```
 
+List active tasks from the configured ClickUp List:
+
+```text
+/taskapp list
+```
+
+The list response is ephemeral and includes each task's title, status, due date, and ClickUp URL. Closed and archived tasks are excluded.
+
 Help and validation examples:
 
 ```text
 /taskapp help
 /taskapp
+/taskapp list
 ```
 
 Supported command fields:

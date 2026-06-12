@@ -142,6 +142,7 @@ const server = http.createServer(async (req, res) => {
         commandSyntax: {
           command: "/taskapp",
           format: "/taskapp Task name | assign: jay | tags: bug,auth | priority: high | due: tomorrow | description: details",
+          list: "/taskapp list",
           assignees: "Use ClickUp user IDs directly or aliases configured in /setup.",
           tags: "Comma-separated tags. The app always includes the default slack tag.",
           priorities: ["urgent", "high", "normal", "low"],
@@ -300,6 +301,19 @@ const server = http.createServer(async (req, res) => {
         return sendJson(res, 200, {
           response_type: "ephemeral",
           text: buildUsageText(commandName)
+        });
+      }
+
+      if (isListCommand(commandText)) {
+        const connection = findConnectionForRequest({
+          teamId: form.get("team_id"),
+          allowDefault: false
+        });
+        const result = await listTasksForSlack(connection);
+        return sendJson(res, 200, {
+          response_type: "ephemeral",
+          text: result.ok ? buildSlackTaskList(result) : `${result.error}\nSetup: ${APP_BASE_URL}/setup`,
+          workflow: result
         });
       }
 
@@ -505,6 +519,48 @@ async function listActiveTasks({ connection, page }) {
     assignees: normalizeClickUpMembers(membersResponse.data),
     page,
     hasMore: rawTasks.length === 100
+  };
+}
+
+async function listTasksForSlack(connection) {
+  const validationError = validateTaskManagementConnection(connection);
+  if (validationError) return { ok: false, source: "slack_list", error: validationError };
+
+  const tasks = [];
+  const maxPages = 10;
+  let page = 0;
+  let hasMore = true;
+
+  while (hasMore && page < maxPages) {
+    const query = new URLSearchParams({
+      archived: "false",
+      include_closed: "false",
+      page: String(page),
+      order_by: "updated",
+      reverse: "true"
+    });
+    const response = await clickUpRequest(
+      connection,
+      "GET",
+      `/list/${connection.clickupListId}/task?${query}`
+    );
+    if (!response.ok) return { ...response, source: "slack_list" };
+
+    const rawTasks = response.data.tasks || [];
+    tasks.push(...rawTasks
+      .filter(Boolean)
+      .map(normalizeManagedTask)
+      .filter((task) => !task.archived && task.statusType !== "closed"));
+    hasMore = rawTasks.length === 100;
+    page += 1;
+  }
+
+  return {
+    ok: true,
+    source: "slack_list",
+    connection: sanitizeConnection(connection),
+    tasks,
+    truncatedByPageLimit: hasMore
   };
 }
 
@@ -2022,14 +2078,53 @@ function isHelpCommand(text) {
   return ["help", "-h", "--help"].includes(value);
 }
 
+function isListCommand(text) {
+  return String(text || "").trim().toLowerCase() === "list";
+}
+
 function buildUsageText(commandName) {
   return [
     `Usage: ${commandName} Task name | assign: jay | tags: bug,auth | priority: high | due: tomorrow | description: details`,
+    `List active tasks: ${commandName} list`,
     "Assign: ClickUp user ID or alias configured in /setup",
     "Tags: comma-separated values",
     "Priorities: urgent, high, normal, low",
     "Due: today, tomorrow, or YYYY-MM-DD"
   ].join("\n");
+}
+
+function buildSlackTaskList(result) {
+  if (!result.tasks.length) return "No active tasks found in the configured ClickUp List.";
+
+  const maxLength = 35_000;
+  const lines = [`Active ClickUp tasks (${result.tasks.length}):`];
+  let omitted = 0;
+
+  for (let index = 0; index < result.tasks.length; index += 1) {
+    const task = result.tasks[index];
+    const details = [
+      task.status || "no status",
+      task.dueDate ? `due ${formatSlackTaskDueDate(task.dueDate)}` : "no due date"
+    ].join(" · ");
+    const line = `${index + 1}. ${task.name} — ${details}\n${task.url}`;
+    if ([...lines, line].join("\n").length > maxLength) {
+      omitted = result.tasks.length - index;
+      break;
+    }
+    lines.push(line);
+  }
+
+  if (omitted) lines.push(`…and ${omitted} more task${omitted === 1 ? "" : "s"}. Open ${APP_BASE_URL}/setup?tab=tasks to view them.`);
+  if (result.truncatedByPageLimit) lines.push("Additional tasks may exist beyond the first 1,000 results.");
+  return lines.join("\n");
+}
+
+function formatSlackTaskDueDate(value) {
+  return new Intl.DateTimeFormat("en-US", {
+    year: "numeric",
+    month: "short",
+    day: "numeric"
+  }).format(new Date(value));
 }
 
 function buildSlackConfirmation(result) {
